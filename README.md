@@ -1,6 +1,6 @@
 # Path
 
-**Path** (`pathfm`) is a fast, responsive, and modular X11 file manager for Linux. It combines a lightweight, multi-threaded Rust backend daemon (`pathd`) with a smooth, declarative Qt6/QML frontend powered by [Quickshell](https://quickshell.outfoxxed.me/).
+**Path** (`pathfm`) is a fast, responsive, and modular X11 file manager. It combines a lightweight, multi-threaded Rust backend daemon (`pathd`) with a smooth, declarative Qt6/QML frontend powered by [Quickshell](https://quickshell.outfoxxed.me/).
 
 ---
 
