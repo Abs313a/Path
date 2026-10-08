@@ -1,0 +1,33 @@
+# Maintainer: David Clark <david.j.clark@icloud.com>
+# Repackages the release build from GitHub. NOT published: the AUR was not taking new accounts
+# when 0.1.0 shipped, so the release workflow no longer pushes it; `install.sh` at the repository
+# root is how path is installed. Kept for the day the AUR is an option again.
+pkgname=path-bin
+_pkgname=path
+pkgver=0.2.2
+pkgrel=1
+pkgdesc="A light, practical file manager: Rust daemon, Quickshell front end (binary release)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Abs313a/Path"
+license=('MIT')
+# Keep in step with packaging/PKGBUILD.
+depends=('quickshell' 'xdg-desktop-portal' 'ffmpeg' 'gnome-keyring' 'libsecret' 'libarchive'
+         'udisks2' 'git' 'qt6-declarative' 'qt6-multimedia' 'poppler' 'glib2' 'gvfs')
+optdepends=('noto-fonts-cjk: Japanese on screen (the interface is in English, Spanish and Japanese)'
+            'openssh: SFTP host key tools'
+            'gvfs-smb: SMB (Windows share) locations'
+            'gvfs-wsdd: find Windows computers on the network'
+            'tailscale: share files over Taildrop')
+provides=('path')
+conflicts=('path')
+install=path.install
+source_x86_64=("${url}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-1-x86_64.pkg.tar.zst")
+source_aarch64=("${url}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-1-aarch64.pkg.tar.zst")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  # The release asset is a complete pacman package; unpack its payload into $pkgdir.
+  bsdtar -xf "${srcdir}/${_pkgname}-${pkgver}-1-${CARCH}.pkg.tar.zst" -C "${pkgdir}" \
+    --exclude .PKGINFO --exclude .BUILDINFO --exclude .MTREE --exclude .INSTALL
+}

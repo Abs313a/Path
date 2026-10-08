@@ -1,0 +1,16 @@
+[package]
+name = "path-plugin-share-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path share plugin: mail (desktop composer or SMTP with attachments)"
+
+[[bin]]
+name = "path-plugin-share-mail"
+path = "src/main.rs"
+
+[dependencies]
+path-plugin-sdk = { path = "../../crates/path-plugin-sdk" }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"

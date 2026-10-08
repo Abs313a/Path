@@ -1,0 +1,17 @@
+[package]
+name = "path-plugin-ftps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path location plugin: FTP over TLS"
+
+[[bin]]
+name = "path-plugin-ftps"
+path = "src/main.rs"
+
+[dependencies]
+path-plugin-sdk = { path = "../../crates/path-plugin-sdk" }
+suppaftp = { version = "6", default-features = false, features = ["rustls", "deprecated"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"

@@ -1,0 +1,30 @@
+[
+  {
+    "file": "delegate/LICENSE-MIT",
+    "url": "https://raw.githubusercontent.com/kobzol/rust-delegate/b129d4cbf4cc499eff7743365dcb0fe5d8d2e820/LICENSE-MIT"
+  },
+  {
+    "file": "delegate/LICENSE-APACHE",
+    "url": "https://raw.githubusercontent.com/kobzol/rust-delegate/b129d4cbf4cc499eff7743365dcb0fe5d8d2e820/LICENSE-APACHE"
+  },
+  {
+    "file": "lazy-regex/LICENSE",
+    "url": "https://raw.githubusercontent.com/Canop/lazy-regex/39a459c01e1ba2488075be50a821e2d72e466241/LICENSE"
+  },
+  {
+    "file": "russh-0.52.1/LICENSE-2.0.txt",
+    "url": "https://raw.githubusercontent.com/warp-tech/russh/5e913966780dc226f52367be1a6666ddfcee81dc/LICENSE-2.0.txt"
+  },
+  {
+    "file": "russh-0.52.0/LICENSE-2.0.txt",
+    "url": "https://raw.githubusercontent.com/warp-tech/russh/3d09c20c52a542ffa327723d3a44cb1edd9b0ca4/LICENSE-2.0.txt"
+  },
+  {
+    "file": "suppaftp/LICENSE-MIT",
+    "url": "https://raw.githubusercontent.com/veeso/suppaftp/96cb46417e65ccb0f9f0b7ec8613c141c151c6b5/LICENSE-MIT"
+  },
+  {
+    "file": "suppaftp/LICENSE-APACHE",
+    "url": "https://raw.githubusercontent.com/veeso/suppaftp/96cb46417e65ccb0f9f0b7ec8613c141c151c6b5/LICENSE-APACHE"
+  }
+]

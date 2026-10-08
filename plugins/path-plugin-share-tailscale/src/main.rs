@@ -1,0 +1,132 @@
+//! Tailscale: Taildrop to online peers via `tailscale file cp`.
+use path_plugin_sdk::json::{self, Value};
+use path_plugin_sdk::{self as sdk, PluginError, Result, ShareDescribe, ShareHandler, ShareProgress, ShareResult, Target};
+use std::process::Command;
+
+struct Tailscale;
+
+fn peers() -> Result<Vec<Target>> {
+    if !sdk::detected("tailscale") {
+        return Err(PluginError::new("Unsupported", "tailscale is not installed"));
+    }
+    let out = Command::new("tailscale").args(["status", "--json"]).output().map_err(PluginError::io)?;
+    if !out.status.success() {
+        return Err(PluginError::network("tailscale is not running or not logged in (try: tailscale up)"));
+    }
+    peers_from(&out.stdout)
+}
+
+/// The peers in a `tailscale status --json` document, online ones first.
+fn peers_from(status: &[u8]) -> Result<Vec<Target>> {
+    let v = json::parse(status).map_err(|e| PluginError::io(e.to_string()))?;
+    let mut targets = Vec::new();
+    if let Some(Value::Obj(peers)) = v.get("Peer") {
+        for p in peers.values() {
+            let dns = p.str_field("DNSName").unwrap_or("").trim_end_matches('.').to_string();
+            // The name the tailnet knows it by — what `tailscale status` prints — not the one the
+            // machine gives itself: an iPhone's own hostname is "localhost".
+            let short = dns.split('.').next().unwrap_or("");
+            let name = if short.is_empty() { p.str_field("HostName").unwrap_or("").to_string() } else { short.to_string() };
+            let online = p.get("Online").and_then(Value::as_bool).unwrap_or(false);
+            let os = p.str_field("OS").unwrap_or("").to_string();
+            targets.push(Target { id: dns.split('.').next().unwrap_or(&name).to_string(), name, detail: os, online, icon: "server".into() });
+        }
+    }
+    targets.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
+    Ok(targets)
+}
+
+impl ShareHandler for Tailscale {
+    fn describe(&self) -> ShareDescribe {
+        ShareDescribe {
+            id: "tailscale",
+            name: "Tailscale",
+            icon: "cloud",
+            version: "1.0",
+            accepts_files: true,
+            accepts_folders: false,
+            accepts_multiple: true,
+            max_bytes: None,
+            targets: "list",
+            form: vec![],
+            secret_fields: vec![],
+            compose: vec![],
+            requires: vec!["tailscale"],
+        }
+    }
+    fn targets(&mut self, _c: &Value, _s: &Value, query: Option<&str>) -> Result<Vec<Target>> {
+        let mut t = peers()?;
+        if let Some(q) = query {
+            let q = q.to_lowercase();
+            t.retain(|x| x.name.to_lowercase().contains(&q));
+        }
+        Ok(t)
+    }
+    fn share(&mut self, _c: &Value, _s: &Value, files: &[String], target: Option<&str>, _compose: &Value, p: &mut ShareProgress) -> Result<ShareResult> {
+        let peer = target.ok_or_else(|| PluginError::new("Invalid", "pick a peer"))?;
+        let total = files.len() as u64;
+        let bytes_total: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+        let mut bytes = 0u64;
+        for (i, f) in files.iter().enumerate() {
+            p.report(i as u64, total, bytes, bytes_total, &format!("sending {f}"));
+            // Tailscale's own words when it refuses — "target is offline", "not logged in" — are
+            // the whole of the explanation; they used to go to a terminal nobody was reading.
+            let out = Command::new("tailscale").args(["file", "cp"]).arg(f).arg(format!("{peer}:")).output().map_err(PluginError::io)?;
+            if !out.status.success() {
+                let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(PluginError::network(format!("tailscale would not send {f} to {peer}{}", if why.is_empty() { String::new() } else { format!(": {why}") })));
+            }
+            bytes += std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        }
+        p.report(total, total, bytes, bytes_total, "sent");
+        // Handed to Tailscale, which is all this end can know: the file waits in the other
+        // device's Tailscale until it is taken — Downloads on a Mac, the Tailscale app on a phone.
+        Ok(ShareResult { result: "sent", detail: Some(format!("{total} {} to {peer}, waiting in its Tailscale", if total == 1 { "file" } else { "files" })) })
+    }
+}
+
+fn main() {
+    let _ = sdk::run_share(&mut Tailscale);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATUS: &[u8] = br#"{"Peer":{
+        "a":{"HostName":"laptop","DNSName":"laptop.tail1234.ts.net.","Online":false,"OS":"linux"},
+        "b":{"HostName":"phone","DNSName":"phone.tail1234.ts.net.","Online":true,"OS":"android"}
+    }}"#;
+
+    #[test]
+    fn peers_are_named_by_their_short_name_and_sorted_online_first() {
+        let t = peers_from(STATUS).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].name, "phone"); // online before offline
+        assert_eq!(t[0].id, "phone"); // the DNS name without the tailnet
+        assert!(t[0].online);
+        assert_eq!(t[0].detail, "android");
+        assert_eq!(t[1].name, "laptop");
+        assert!(!t[1].online);
+    }
+
+    #[test]
+    fn a_peer_is_called_what_the_tailnet_calls_it() {
+        let t = peers_from(
+            br#"{"Peer":{"a":{"HostName":"localhost","DNSName":"iphone-12-pro.tail1234.ts.net.","Online":true,"OS":"iOS"},
+                                       "b":{"HostName":"nas","DNSName":"","Online":true,"OS":"linux"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(t.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["iphone-12-pro", "nas"]);
+    }
+
+    #[test]
+    fn a_status_document_with_no_peers_is_empty_not_an_error() {
+        assert!(peers_from(b"{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn nonsense_is_an_error_rather_than_a_panic() {
+        assert!(peers_from(b"not json").is_err());
+    }
+}

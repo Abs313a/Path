@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["pathd", "crates/path-json", "crates/path-plugin-sdk", "plugins/path-plugin-sftp", "plugins/path-plugin-ftps", "plugins/path-plugin-gio", "plugins/path-plugin-dbus", "plugins/path-plugin-share-mail", "plugins/path-plugin-share-tailscale"]
+
+[workspace.package]
+version = "0.2.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abs313a/Path"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

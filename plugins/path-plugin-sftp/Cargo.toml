@@ -1,0 +1,20 @@
+[package]
+name = "path-plugin-sftp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path location plugin: SFTP over SSH, with exec-accelerated listing"
+
+[[bin]]
+name = "path-plugin-sftp"
+path = "src/main.rs"
+
+[dependencies]
+path-plugin-sdk = { path = "../../crates/path-plugin-sdk" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros"] }
+russh = "0.52"
+russh-sftp = "2"
+
+[dev-dependencies]
+rand = "0.8"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }

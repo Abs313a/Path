@@ -1,0 +1,15 @@
+[package]
+name = "path-plugin-gio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path location plugin over GIO/GVfs: smb in 0.1.0, dav and afp behind a second install name (links GLib, build on Omarchy)"
+
+[[bin]]
+name = "path-plugin-gio"
+path = "src/main.rs"
+
+[dependencies]
+path-plugin-sdk = { path = "../../crates/path-plugin-sdk" }
+gio = { version = "0.20", features = ["v2_62"] }
+glib = "0.20"

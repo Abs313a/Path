@@ -1,0 +1,15 @@
+[package]
+name = "path-plugin-dbus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path's D-Bus face: org.freedesktop.FileManager1 and the FileChooser portal backend"
+
+[[bin]]
+name = "path-plugin-dbus"
+path = "src/main.rs"
+
+[dependencies]
+path-plugin-sdk = { path = "../../crates/path-plugin-sdk" }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util"] }

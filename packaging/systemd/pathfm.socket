@@ -1,0 +1,12 @@
+[Unit]
+Description=path file manager daemon socket
+
+[Socket]
+ListenStream=%t/pathfm-@VERSION@.sock
+SocketMode=0600
+# The unit is pathfm.socket and the service pathd.service: without this systemd looks for a
+# path.service, finds none and refuses to listen ("Socket service path.service not loaded").
+Service=pathd.service
+
+[Install]
+WantedBy=sockets.target

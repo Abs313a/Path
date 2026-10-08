@@ -1,0 +1,46 @@
+#!/bin/sh
+# path launcher: one window per session. A second launch hands its folder to the one already
+# running and brings that to the front.
+#
+# The running instance is found the way it was started — by the path of its shell.qml. (It used to
+# be looked for with `qs -c pathfm`, a named config this package does not install, so it was never
+# found and every launch was another window.) The folder goes in PATHFM_START, which is what the
+# shell reads; as an argument after `--` it was never looked at, and every launch opened home.
+set -e
+CONF="${PATHFM_SHELL_DIR:-/usr/share/path}/shell.qml"
+# `pathfm --ipc <function> [args…]`: a call into the running window, for tools path started — the
+# Neovim preset tells it a file was saved, or asks it to reveal one. Quiet when path is not up.
+if [ "${1:-}" = "--ipc" ]; then
+  shift
+  exec qs -p "$CONF" ipc call shell "$@" >/dev/null 2>&1
+fi
+case "${1:-}" in
+  "") uri="file://$HOME" ;;
+  *://*) uri="$1" ;;
+  /*) uri="file://$1" ;;
+  *) uri="file://$PWD/$1" ;;
+esac
+if qs -p "$CONF" ipc call shell present "$uri" >/dev/null 2>&1; then
+  exit 0
+fi
+# The daemon comes up on demand through its socket unit. The package enables that for every user
+# from their NEXT login; straight after installing it is not there yet, so ask for it here — as
+# the user, which the package's own hooks (run as root) cannot do. Harmless when already up, and
+# skipped for a checkout, which runs a daemon of its own.
+# After an upgrade the session still holds the units as they were installed before (pacman runs
+# as root and cannot reach a user's manager), and the socket is named for the version: reload,
+# and when the socket THIS version listens on is not there, restart the socket and the daemon —
+# a start is a no-op on a unit still active from the old definition ("Unit configuration
+# changed while unit was running … not functional until restarted"), and the old daemon holds
+# the old listening descriptor. The user's own path.install note said to do this by hand.
+if [ -z "${PATHFM_SHELL_DIR:-}" ]; then
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  ver="$(pathd --version 2>/dev/null | awk '{print $2}')"
+  sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pathfm-${ver}.sock"
+  if [ -n "$ver" ] && [ ! -S "$sock" ]; then
+    systemctl --user restart pathfm.socket pathd.service >/dev/null 2>&1 || true
+  else
+    systemctl --user start pathfm.socket >/dev/null 2>&1 || true
+  fi
+fi
+PATHFM_START="$uri" exec qs -n -p "$CONF"

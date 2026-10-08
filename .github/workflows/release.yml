@@ -1,0 +1,149 @@
+name: Release
+
+# Run by hand, from the Actions tab. Takes the packages the newest green CI run on main built,
+# drives the x86_64 one under a compositor, then tags the commit
+# those packages were built from and publishes them. Nothing is built here: what is released is
+# byte for byte what CI tested. The version is the code's — `pkgver` in that commit's PKGBUILD —
+# and a version already tagged is refused, so releasing is: bump `pkgver` (and the workspace
+# version), push, wait for green, run this.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Tag and publish. Off: just drive the package and stop.'
+        type: boolean
+        default: true
+
+# The token needs to read Actions: `gh run list` and pulling another run's artifacts both go
+# through that API, and the repository's default token has contents only.
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  pick:
+    name: Pick the CI run
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.pick.outputs.run_id }}
+      sha: ${{ steps.pick.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          [ -n "$run" ] || { echo "no successful CI run on main to release"; exit 1; }
+          sha="$(gh run view --repo "$GITHUB_REPOSITORY" "$run" --json headSha --jq .headSha)"
+          # The newest green run is not the newest run when main has moved and its CI is still
+          # going, or went red: releasing then quietly ships the commit before the fix. Say so and
+          # stop. (A commit CI skips, docs only, starts no run, so it cannot trip this.)
+          newest="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main --limit 1 --json databaseId,headSha,status,conclusion --jq '.[0]')"
+          newest_id="$(jq -r .databaseId <<<"$newest")"
+          if [ "$newest_id" != "$run" ]; then
+            echo "the newest CI run on main is $(jq -r .headSha <<<"$newest") ($(jq -r '.status + (if .conclusion then " / " + .conclusion else "" end)' <<<"$newest")), not the newest green one ($sha)."
+            echo "Wait for it to pass, or fix it, before releasing."
+            exit 1
+          fi
+          echo "run_id=$run" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pick.outputs.sha }}
+          fetch-tags: true
+      - id: version
+        name: The version is the code's, and not one already released
+        run: |
+          version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
+          [ -n "$version" ] || { echo "no pkgver in packaging/PKGBUILD"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already a tag: bump pkgver in packaging/PKGBUILD (and the workspace version) and push first"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing CI run ${{ steps.pick.outputs.run_id }}, commit ${{ steps.pick.outputs.sha }}, as v$version"
+
+  # The package, installed and used: the daemon and the shell it ships, driven under a headless
+  # compositor through twenty-five flows (tests/e2e), from the commit the package was built at.
+  # x86_64 only for now.
+  drive:
+    name: Install the package and drive it (x86_64, under cage)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    needs: pick
+    steps:
+      - name: Install runtime
+        run: |
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed git sudo cage wtype grim dbus \
+            xdg-desktop-portal gnome-keyring openssh vsftpd ffmpeg python nodejs npm \
+            qt6-base qt6-declarative qt6-wayland quickshell samba gvfs-smb
+          useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.pick.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: path-package-x86_64
+          path: pkg
+          run-id: ${{ needs.pick.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: The package carries the version
+        run: ls "pkg/path-${{ needs.pick.outputs.version }}-1-x86_64.pkg.tar.zst" || { echo "CI run ${{ needs.pick.outputs.run_id }} built:"; ls pkg; echo "not ${{ needs.pick.outputs.version }}, the pkgver of its own commit — that should not happen"; exit 1; }
+      - name: Install the package
+        run: pacman -U --noconfirm --overwrite '*' pkg/path-*.pkg.tar.zst
+      - name: Run the flows under cage
+        # No build tree here on purpose: the harness falls back to the installed path, so what
+        # runs is the package. Flows that need something this image does not have — a pointer
+        # that the compositor can map to an output — skip by name and say so.
+        run: |
+          chown -R builder .
+          sudo -u builder bash -c 'tests/e2e/run.sh'
+      - name: Show the logs
+        if: always()
+        run: tail -n 40 tests/e2e/out/*.log || true
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-diffs
+          path: tests/e2e/out/**
+
+  publish:
+    name: Tag and publish
+    runs-on: ubuntu-latest
+    needs: [pick, drive]
+    if: inputs.publish
+    # A job's own `permissions` replaces the workflow's, so the read is repeated here.
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: path-package-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ needs.pick.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Both architectures, both checksums
+        run: |
+          cd dist && ls -l
+          for a in x86_64 aarch64; do
+            f="path-${{ needs.pick.outputs.version }}-1-$a.pkg.tar.zst"
+            [ -f "$f" ] && [ -f "$f.sha256" ] || { echo "missing $f or its checksum"; exit 1; }
+            sha256sum -c "$f.sha256"
+          done
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.pick.outputs.version }}
+          target_commitish: ${{ needs.pick.outputs.sha }}
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Install or upgrade on Arch / Omarchy:
+
+                curl -fsSL https://raw.githubusercontent.com/Abs313a/Path/main/install.sh | bash
+
+            Or download the package for your architecture below and `sudo pacman -U` it.

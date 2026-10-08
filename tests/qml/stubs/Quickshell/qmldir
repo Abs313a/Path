@@ -1,0 +1,8 @@
+# Stand-ins for the Quickshell types the path singletons declare, so the leaf tests can import
+# the path module without Quickshell installed. Passed to qmltestrunner with -import.
+module Quickshell
+singleton Quickshell 1.0 Quickshell.qml
+Singleton 1.0 Singleton.qml
+FileView 1.0 FileView.qml
+FloatingWindow 1.0 FloatingWindow.qml
+IpcHandler 1.0 IpcHandler.qml

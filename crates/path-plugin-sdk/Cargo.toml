@@ -1,0 +1,10 @@
+[package]
+name = "path-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Write a path location plugin: framing, dispatch loop and typed handler trait"
+
+[dependencies]
+path-json = { path = "../path-json" }
+log = { version = "0.4", features = ["std"] }

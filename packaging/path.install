@@ -1,0 +1,28 @@
+
+post_install() {
+  update-desktop-database -q 2>/dev/null || true
+  gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+  systemctl --global enable pathfm.socket 2>/dev/null || true
+  echo ":: path is installed. Start it from the launcher or with 'pathfm'; on first start it offers to"
+  echo "   become the folder handler and the file chooser for your user."
+  echo "   (Its daemon starts on demand: the 'pathfm' command sees to that until your next login.)"
+}
+
+post_upgrade() {
+  update-desktop-database -q 2>/dev/null || true
+  gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+  echo ":: path was upgraded. The socket is named for the version, so the new path will not find"
+  echo "   the daemon still running from before; as your user:"
+  echo "   systemctl --user daemon-reload && systemctl --user restart pathfm.socket pathd.service"
+}
+
+pre_remove() {
+  systemctl --global disable pathfm.socket 2>/dev/null || true
+}
+
+post_remove() {
+  update-desktop-database -q 2>/dev/null || true
+  gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+  echo ":: path removed. If it was your folder handler, choose another:"
+  echo "   xdg-mime default <app>.desktop inode/directory"
+}

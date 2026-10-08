@@ -1,0 +1,10 @@
+module path
+singleton Daemon 1.0 path/Daemon.qml
+singleton Theme 1.0 path/Theme.qml
+singleton Settings 1.0 path/Settings.qml
+singleton Format 1.0 path/Format.qml
+singleton Jobs 1.0 path/Jobs.qml
+WindowCache 1.0 path/WindowCache.qml
+Selection 1.0 path/Selection.qml
+Pane 1.0 path/Pane.qml
+Shell 1.0 path/Shell.qml

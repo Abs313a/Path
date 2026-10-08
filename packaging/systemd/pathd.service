@@ -1,0 +1,8 @@
+[Unit]
+Description=path file manager daemon
+Requires=pathfm.socket
+
+[Service]
+ExecStart=/usr/bin/pathd
+Restart=on-failure
+Nice=5

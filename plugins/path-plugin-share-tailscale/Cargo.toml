@@ -1,0 +1,13 @@
+[package]
+name = "path-plugin-share-tailscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path share plugin: tailscale"
+
+[[bin]]
+name = "path-plugin-share-tailscale"
+path = "src/main.rs"
+
+[dependencies]
+path-plugin-sdk = { path = "../../crates/path-plugin-sdk" }

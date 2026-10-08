@@ -1,0 +1,46 @@
+[package]
+name = "pathd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "path file manager daemon"
+
+[lib]
+name = "pathd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pathd"
+path = "src/main.rs"
+
+[[bin]]
+name = "path-thumber"
+path = "src/bin/path-thumber.rs"
+
+[[bin]]
+name = "path-plugin-stub"
+path = "src/bin/path-plugin-stub.rs"
+
+# The share host's own stub, built only for the test build (the dev-dependency below turns `stub`
+# on): `share.rs` fetches, zips and hands over local paths, and something has to be there to
+# receive them. A shipped path never builds it.
+[[bin]]
+name = "path-plugin-share-stub"
+path = "src/bin/path-plugin-share-stub.rs"
+required-features = ["stub"]
+
+[features]
+# The contract test drives the stub plugin, which is a location kind like any other, so the test
+# build turns it on through the dev-dependency below. Shipped builds never have it.
+stub = []
+
+[dependencies]
+path-json = { path = "../crates/path-json" }
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+png = "0.17"
+syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+
+[dev-dependencies]
+# Depending on ourselves is how a crate enables one of its own features for its tests only.
+pathd = { path = ".", features = ["stub"] }

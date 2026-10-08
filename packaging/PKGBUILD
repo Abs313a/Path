@@ -1,0 +1,73 @@
+# Maintainer: David Clark <david.j.clark@icloud.com>
+# Source package: builds path from the repository checkout one level up.
+pkgname=path
+pkgver=0.2.2
+pkgrel=1
+pkgdesc="A light, practical file manager: Rust daemon, Quickshell front end"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Abs313a/Path"
+license=('MIT')
+depends=('quickshell' 'xdg-desktop-portal' 'ffmpeg' 'gnome-keyring' 'libsecret' 'libarchive'
+         'udisks2' 'git' 'qt6-declarative' 'qt6-multimedia' 'poppler' 'glib2' 'gvfs')
+makedepends=('rust' 'cargo' 'clang' 'pkgconf' 'glib2')
+optdepends=('noto-fonts-cjk: Japanese on screen (the interface is in English, Spanish and Japanese)'
+            'openssh: SFTP host key tools'
+            'gvfs-smb: SMB (Windows share) locations'
+            'gvfs-wsdd: find Windows computers on the network'
+            'tailscale: share files over Taildrop')
+install=path.install
+options=('!lto' '!debug')
+
+_srcdir="${startdir}/.."
+
+# Cargo builds under makepkg's own tree unless the caller has a target directory already —
+# CI does, cached between runs, and a release build from cold is the slowest thing it does.
+_target() { echo "${CARGO_TARGET_DIR:-${srcdir}/target}"; }
+
+build() {
+  cd "${_srcdir}"
+  export CARGO_TARGET_DIR="$(_target)"
+  cargo build --release --locked
+}
+
+check() {
+  cd "${_srcdir}"
+  export CARGO_TARGET_DIR="$(_target)"
+  cargo test --release --locked
+}
+
+package() {
+  local t="$(_target)/release"
+  install -Dm755 "${t}/pathd"            "${pkgdir}/usr/bin/pathd"
+  # The only part of path that decodes a file's contents, and so the only part a malformed file
+  # can bring down. pathd looks for it beside itself, then here. Without it: no thumbnails.
+  install -Dm755 "${t}/path-thumber"     "${pkgdir}/usr/lib/path/path-thumber"
+  install -Dm755 "${t}/path-plugin-sftp" "${pkgdir}/usr/lib/path/plugins/path-plugin-sftp"
+  install -Dm755 "${t}/path-plugin-ftps" "${pkgdir}/usr/lib/path/plugins/path-plugin-ftps"
+  for p in dbus share-mail share-tailscale; do
+    install -Dm755 "${t}/path-plugin-$p" "${pkgdir}/usr/lib/path/plugins/path-plugin-$p"
+  done
+  # A location kind is the suffix of the name the plugin is run by: gio goes in as smb.
+  install -Dm755 "${t}/path-plugin-gio" "${pkgdir}/usr/lib/path/plugins/path-plugin-smb"
+  install -Dm755 "${_srcdir}/packaging/bin/pathfm" "${pkgdir}/usr/bin/pathfm"
+
+  install -d "${pkgdir}/usr/share/path"
+  cp -r "${_srcdir}/qml/." "${pkgdir}/usr/share/path/"
+
+  # The socket is named for the version (pathfm-0.2.0.sock): a window and a daemon are a pair.
+  install -d "${pkgdir}/usr/lib/systemd/user"
+  sed "s/@VERSION@/${pkgver}/" "${_srcdir}/packaging/systemd/pathfm.socket" > "${pkgdir}/usr/lib/systemd/user/pathfm.socket"
+  install -Dm644 "${_srcdir}/packaging/systemd/pathd.service" "${pkgdir}/usr/lib/systemd/user/pathd.service"
+  install -Dm644 "${_srcdir}/packaging/pathfm.desktop"  "${pkgdir}/usr/share/applications/pathfm.desktop"
+  # Desktop launchers scale the supplied raster proportionally; About ships its own mark.
+  install -Dm644 "${_srcdir}/app-images/path-app-list.png" "${pkgdir}/usr/share/icons/hicolor/512x512/apps/pathfm.png"
+  # `Exec=pathfm %U` is how path starts, and the launcher hands a second start to the first.
+  install -Dm644 "${_srcdir}/packaging/org.freedesktop.impl.portal.desktop.pathfm.service" "${pkgdir}/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.pathfm.service"
+  install -Dm644 "${_srcdir}/packaging/path.portal"           "${pkgdir}/usr/share/xdg-desktop-portal/portals/path.portal"
+  # path.portal only makes the chooser AVAILABLE. Whether it is used is each user's choice, made
+  # in path's first-run dialog, which writes ~/.config/xdg-desktop-portal/portals.conf
+  # (FileChooser=path;gtk — beside GTK's, which stays the fallback). A system-wide
+  # path-portals.conf was shipped here once; xdg-desktop-portal reads <desktop>-portals.conf, so
+  # on Hyprland a file of that name was never read, and it said something the dialog does not.
+  install -Dm644 "${_srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

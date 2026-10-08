@@ -1,0 +1,1229 @@
+//! Drives the `path-plugin-sftp` binary over its pipe protocol against an in-process mock SSH
+//! server (russh server + russh-sftp server over an in-memory tree) whose exec channel emulates
+//! the `find`/`stat` flavours the plugin probes for. Covers: GNU fast scan, the POSIX `stat -c`
+//! and `stat -f` fallbacks, a refused exec channel, a killed exec stream falling back to READDIR
+//! without duplicates, GNU find's exit status 1, pipelined reads, and the write/stat/mkdir/rename/
+//! delete/setmtime/chmod round trip.
+
+use path_plugin_sdk::json::{self, Value};
+use path_plugin_sdk::{read_frame, write_binary, write_json};
+use russh::keys::{Algorithm, PrivateKey};
+use russh::server::{Auth, Msg, Session};
+use russh::{Channel, ChannelId, CryptoVec};
+use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+// ---------------------------------------------------------------- in-memory tree
+
+#[derive(Clone)]
+enum NodeKind {
+    Dir,
+    File(Vec<u8>),
+    Link(String),
+}
+
+#[derive(Clone)]
+struct Node {
+    kind: NodeKind,
+    mode: u32,
+    mtime: u32,
+}
+
+type Fs = Arc<Mutex<BTreeMap<String, Node>>>;
+
+fn attrs(n: &Node) -> FileAttributes {
+    let mut a = FileAttributes { size: Some(0), uid: Some(1000), user: Some("path".into()), gid: Some(1000), group: Some("path".into()), permissions: Some(n.mode), atime: Some(n.mtime), mtime: Some(n.mtime) };
+    match &n.kind {
+        NodeKind::Dir => a.set_dir(true),
+        NodeKind::File(b) => {
+            a.size = Some(b.len() as u64);
+            a.set_regular(true);
+        }
+        NodeKind::Link(t) => {
+            a.size = Some(t.len() as u64);
+            a.set_symlink(true);
+        }
+    }
+    a
+}
+
+fn children(fs: &BTreeMap<String, Node>, dir: &str, recursive: bool) -> Vec<(String, Node)> {
+    let prefix = if dir == "/" { "/".to_string() } else { format!("{dir}/") };
+    fs.iter().filter(|(p, _)| p.starts_with(&prefix) && p.len() > prefix.len() && (recursive || !p[prefix.len()..].contains('/'))).map(|(p, n)| (p.clone(), n.clone())).collect()
+}
+
+fn pseudo_random(len: usize) -> Vec<u8> {
+    let mut x: u32 = 0x1234_5678;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+fn fixture() -> Fs {
+    let mut m = BTreeMap::new();
+    let d = |m: &mut BTreeMap<String, Node>, p: &str| {
+        m.insert(p.to_string(), Node { kind: NodeKind::Dir, mode: 0o755, mtime: 1_700_000_000 });
+    };
+    let f = |m: &mut BTreeMap<String, Node>, p: &str, b: &[u8], mt: u32| {
+        m.insert(p.to_string(), Node { kind: NodeKind::File(b.to_vec()), mode: 0o644, mtime: mt });
+    };
+    d(&mut m, "/");
+    d(&mut m, "/docs");
+    f(&mut m, "/docs/readme.md", b"hello", 1_700_000_001);
+    d(&mut m, "/docs/sub");
+    f(&mut m, "/docs/sub/deep.txt", b"deep", 1_700_000_002);
+    d(&mut m, "/empty");
+    f(&mut m, "/data.bin", &pseudo_random(4 * 1024 * 1024 + 12_345), 1_700_000_003);
+    f(&mut m, "/we ird'na\nme.txt", b"odd", 1_700_000_004);
+    m.insert("/link".into(), Node { kind: NodeKind::Link("/docs/readme.md".into()), mode: 0o777, mtime: 1_700_000_005 });
+    Arc::new(Mutex::new(m))
+}
+
+// ---------------------------------------------------------------- mock server
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExecMode {
+    /// GNU findutils present.
+    Gnu,
+    /// find without -printf, coreutils-style `stat -c`.
+    StatC,
+    /// find without -printf, BSD-style `stat -f`.
+    StatF,
+    /// exec allowed but no find on the box.
+    NoFind,
+    /// exec channel requests are refused (ForceCommand internal-sftp).
+    Refused,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExecFail {
+    None,
+    /// The listing command dies after this many bytes of output (status 137).
+    KillAfter(usize),
+    /// The listing command prints everything and exits 1 (an unreadable entry).
+    ExitOne,
+}
+
+#[derive(Default)]
+struct Counters {
+    readdir: AtomicUsize,
+    reads: AtomicUsize,
+    inflight: AtomicUsize,
+    max_inflight: AtomicUsize,
+    execs: AtomicUsize,
+    /// Successful sign-ins: how many connections this server has really been given.
+    auths: AtomicUsize,
+}
+
+struct MockCfg {
+    exec: ExecMode,
+    fail: ExecFail,
+    /// entries per READDIR reply
+    page: usize,
+    /// How this server lets people in.
+    auth: AuthMode,
+}
+
+/// The ways a server can be set up to take a sign-in. Real ones differ exactly like this: many
+/// refuse the plain `password` method and ask through PAM (keyboard-interactive) instead.
+#[derive(Clone, Default)]
+struct AuthMode {
+    /// Refuse the `password` method outright.
+    no_password_method: bool,
+    /// Accept keyboard-interactive, answered with the password.
+    interactive: bool,
+    /// Public keys (openssh form) that may sign in.
+    authorized: Vec<String>,
+}
+
+/// Public-key offers the server has seen, in order, by fingerprint — so a test can say which
+/// keys were tried and which were not.
+static OFFERED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct Mock {
+    /// The server's host key in `authorized_keys` form, for writing a known_hosts fixture.
+    host_key: String,
+    port: u16,
+    fs: Fs,
+    counters: Arc<Counters>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct MockServer {
+    fs: Fs,
+    cfg: Arc<MockCfg>,
+    counters: Arc<Counters>,
+}
+
+impl russh::server::Server for MockServer {
+    type Handler = SshSession;
+    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> SshSession {
+        SshSession { fs: self.fs.clone(), cfg: self.cfg.clone(), counters: self.counters.clone(), channels: HashMap::new(), inbound: HashMap::new() }
+    }
+}
+
+struct SshSession {
+    fs: Fs,
+    cfg: Arc<MockCfg>,
+    counters: Arc<Counters>,
+    channels: HashMap<ChannelId, Channel<Msg>>,
+    /// per channel: bytes of SFTP packets not yet complete (for counting READ arrivals)
+    inbound: HashMap<ChannelId, Vec<u8>>,
+}
+
+fn unquote(s: &str) -> String {
+    // Undo path_plugin_sdk::shell_quote: 'a'\''b' -> a'b
+    let inner = s.trim().trim_start_matches('\'').trim_end_matches('\'');
+    inner.replace("'\\''", "'")
+}
+
+fn type_words(n: &Node, bsd: bool) -> &'static str {
+    match (&n.kind, bsd) {
+        (NodeKind::Dir, false) => "directory",
+        (NodeKind::File(b), false) if b.is_empty() => "regular empty file",
+        (NodeKind::File(_), false) => "regular file",
+        (NodeKind::Link(_), false) => "symbolic link",
+        (NodeKind::Dir, true) => "Directory",
+        (NodeKind::File(_), true) => "Regular File",
+        (NodeKind::Link(_), true) => "Symbolic Link",
+    }
+}
+
+impl SshSession {
+    /// Emulates the shell side of the exec channel for the commands the plugin issues.
+    fn emulate(&self, cmd: &str) -> (Vec<u8>, u32) {
+        let mode = self.cfg.exec;
+        if cmd.contains("find --version") {
+            return match mode {
+                ExecMode::Gnu => (b"find (GNU findutils) 4.9.0\n".to_vec(), 0),
+                ExecMode::StatC | ExecMode::StatF => (Vec::new(), 0), // `find --version` fails, `| head -1` exits 0
+                _ => (Vec::new(), 1),                                 // command -v find fails
+            };
+        }
+        if cmd.contains("stat -c '%F' /") {
+            return match mode {
+                ExecMode::StatC => (b"statc\n".to_vec(), 0),
+                ExecMode::StatF => (b"statf\n".to_vec(), 0),
+                _ => (Vec::new(), 3),
+            };
+        }
+        if let Some(rest) = cmd.strip_prefix("find ") {
+            let end = rest.find(" -mindepth").expect("find command shape");
+            let path = unquote(&rest[..end]);
+            let recursive = !cmd.contains("-maxdepth 1");
+            let fs = self.fs.lock().unwrap();
+            let list = children(&fs, &path, recursive);
+            let mut out = Vec::new();
+            if cmd.contains("-printf") {
+                assert_eq!(mode, ExecMode::Gnu, "-printf used without GNU find");
+                for (p, n) in &list {
+                    let a = attrs(n);
+                    let ty = match n.kind {
+                        NodeKind::Dir => "d",
+                        NodeKind::File(_) => "f",
+                        NodeKind::Link(_) => "l",
+                    };
+                    let rel = &p[if path == "/" { 1 } else { path.len() + 1 }..];
+                    let shown = if recursive { rel } else { rel.rsplit('/').next().unwrap() };
+                    write!(out, "{ty}\0{}\0{}\0{}.0000000000\0{:o}\0path\0path\0{shown}\0", if ty == "l" { "f" } else { ty }, a.size.unwrap(), n.mtime, n.mode).unwrap();
+                }
+            } else if cmd.contains("-exec sh -c") {
+                let bsd = cmd.contains("stat -f");
+                assert_eq!(bsd, mode == ExecMode::StatF, "stat flavour does not match the probe answer");
+                for (p, n) in &list {
+                    let a = attrs(n);
+                    write!(out, "{}|{}|{}|{:o}|path|path\n{p}\0", type_words(n, bsd), a.size.unwrap(), n.mtime, n.mode).unwrap();
+                }
+            } else {
+                return (b"find: unknown predicate\n".to_vec(), 1);
+            }
+            return match self.cfg.fail {
+                ExecFail::None => (out, 0),
+                ExecFail::ExitOne => (out, 1),
+                ExecFail::KillAfter(n) => {
+                    out.truncate(n);
+                    (out, 137)
+                }
+            };
+        }
+        (b"sh: command not found\n".to_vec(), 127)
+    }
+}
+
+impl russh::server::Handler for SshSession {
+    type Error = russh::Error;
+
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        let ok = !self.cfg.auth.no_password_method && user == "path" && password == "secret";
+        if ok {
+            self.counters.auths.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(if ok { Auth::Accept } else { Auth::Reject { proceed_with_methods: None, partial_success: false } })
+    }
+
+    async fn auth_publickey(&mut self, user: &str, key: &russh::keys::PublicKey) -> Result<Auth, Self::Error> {
+        let offered = key.to_openssh().unwrap_or_default();
+        OFFERED.lock().unwrap().push(offered.clone());
+        let blob = |k: &str| k.split_whitespace().nth(1).unwrap_or("").to_string();
+        let ok = user == "path" && self.cfg.auth.authorized.iter().any(|a| blob(a) == blob(&offered));
+        Ok(if ok { Auth::Accept } else { Auth::Reject { proceed_with_methods: None, partial_success: false } })
+    }
+
+    async fn auth_keyboard_interactive<'a>(&'a mut self, user: &str, _submethods: &str, response: Option<russh::server::Response<'a>>) -> Result<Auth, Self::Error> {
+        if !self.cfg.auth.interactive {
+            return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
+        }
+        match response {
+            None => Ok(Auth::Partial { name: "".into(), instructions: "".into(), prompts: vec![("Password: ".into(), false)].into() }),
+            Some(mut answers) => {
+                let first = answers.next().map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default();
+                Ok(if user == "path" && first == "secret" { Auth::Accept } else { Auth::Reject { proceed_with_methods: None, partial_success: false } })
+            }
+        }
+    }
+
+    async fn channel_open_session(&mut self, channel: Channel<Msg>, _session: &mut Session) -> Result<bool, Self::Error> {
+        self.channels.insert(channel.id(), channel);
+        Ok(true)
+    }
+
+    async fn subsystem_request(&mut self, channel_id: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
+        if name != "sftp" {
+            return session.channel_failure(channel_id);
+        }
+        let channel = self.channels.remove(&channel_id).expect("channel");
+        session.channel_success(channel_id)?;
+        let h = SftpFs { fs: self.fs.clone(), cfg: self.cfg.clone(), counters: self.counters.clone(), cursors: HashMap::new() };
+        let stream = Counting { inner: channel.into_stream(), counters: self.counters.clone(), wbuf: Vec::new() };
+        tokio::spawn(russh_sftp::server::run(stream, h));
+        Ok(())
+    }
+
+    /// Called for every channel data packet as it comes off the socket, before the SFTP task
+    /// gets to it: READ requests counted here minus replies written = requests in flight.
+    async fn data(&mut self, channel_id: ChannelId, data: &[u8], _session: &mut Session) -> Result<(), Self::Error> {
+        let buf = self.inbound.entry(channel_id).or_default();
+        buf.extend_from_slice(data);
+        let counters = &self.counters;
+        drain_packets(buf, |t| {
+            if t == FXP_READ {
+                let now = counters.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                counters.max_inflight.fetch_max(now, Ordering::SeqCst);
+            }
+        });
+        Ok(())
+    }
+
+    async fn exec_request(&mut self, channel_id: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        self.counters.execs.fetch_add(1, Ordering::SeqCst);
+        if self.cfg.exec == ExecMode::Refused {
+            return session.channel_failure(channel_id);
+        }
+        let cmd = String::from_utf8_lossy(data).into_owned();
+        let (out, status) = self.emulate(&cmd);
+        session.channel_success(channel_id)?;
+        for chunk in out.chunks(32 * 1024) {
+            session.data(channel_id, CryptoVec::from(chunk.to_vec()))?;
+        }
+        session.exit_status_request(channel_id, status)?;
+        session.eof(channel_id)?;
+        session.close(channel_id)
+    }
+}
+
+/// Wraps the SFTP channel's write side and counts DATA/STATUS replies, closing the in-flight
+/// count opened by `SshSession::data`.
+struct Counting {
+    inner: russh::ChannelStream<Msg>,
+    counters: Arc<Counters>,
+    wbuf: Vec<u8>,
+}
+
+const FXP_READ: u8 = 5;
+const FXP_STATUS: u8 = 101;
+const FXP_DATA: u8 = 103;
+
+fn drain_packets(buf: &mut Vec<u8>, mut on_type: impl FnMut(u8)) {
+    loop {
+        if buf.len() < 5 {
+            return;
+        }
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if buf.len() < 4 + len {
+            return;
+        }
+        on_type(buf[4]);
+        buf.drain(..4 + len);
+    }
+}
+
+impl tokio::io::AsyncRead for Counting {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Counting {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            self.wbuf.extend_from_slice(&data[..*n]);
+            let counters = self.counters.clone();
+            drain_packets(&mut self.wbuf, |t| {
+                if t == FXP_DATA || t == FXP_STATUS {
+                    let _ = counters.inflight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)));
+                }
+            });
+        }
+        r
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct SftpFs {
+    fs: Fs,
+    cfg: Arc<MockCfg>,
+    counters: Arc<Counters>,
+    /// opendir handle -> next index
+    cursors: HashMap<String, usize>,
+}
+
+fn status(id: u32, code: StatusCode) -> Status {
+    Status { id, status_code: code, error_message: String::new(), language_tag: "en".into() }
+}
+
+impl russh_sftp::server::Handler for SftpFs {
+    type Error = StatusCode;
+
+    fn unimplemented(&self) -> Self::Error {
+        StatusCode::OpUnsupported
+    }
+
+    async fn open(&mut self, id: u32, filename: String, pflags: OpenFlags, _attrs: FileAttributes) -> Result<Handle, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        if pflags.contains(OpenFlags::CREATE) {
+            fs.insert(filename.clone(), Node { kind: NodeKind::File(Vec::new()), mode: 0o644, mtime: 1_700_000_100 });
+        } else if !matches!(fs.get(&filename).map(|n| &n.kind), Some(NodeKind::File(_))) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        Ok(Handle { id, handle: format!("f:{filename}") })
+    }
+
+    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+        self.cursors.remove(&handle);
+        Ok(status(id, StatusCode::Ok))
+    }
+
+    async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+        self.counters.reads.fetch_add(1, Ordering::SeqCst);
+        let fs = self.fs.lock().unwrap();
+        let Some(Node { kind: NodeKind::File(b), .. }) = fs.get(&handle[2..]) else { return Err(StatusCode::NoSuchFile) };
+        if offset as usize >= b.len() {
+            return Err(StatusCode::Eof);
+        }
+        // A real server gives what it likes, not what it is asked for: OpenSSH never more than
+        // 255 KiB, others 32. This one gives at most 50 000 bytes, a number no client asks for, so
+        // every read of a file of any size is a short one that is not the end of the file.
+        let end = (offset as usize + (len as usize).min(50_000)).min(b.len());
+        Ok(Data { id, data: b[offset as usize..end].to_vec() })
+    }
+
+    async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        let Some(Node { kind: NodeKind::File(b), .. }) = fs.get_mut(&handle[2..]) else { return Err(StatusCode::NoSuchFile) };
+        let end = offset as usize + data.len();
+        if b.len() < end {
+            b.resize(end, 0);
+        }
+        b[offset as usize..end].copy_from_slice(&data);
+        Ok(status(id, StatusCode::Ok))
+    }
+
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let fs = self.fs.lock().unwrap();
+        fs.get(&path).map(|n| Attrs { id, attrs: attrs(n) }).ok_or(StatusCode::NoSuchFile)
+    }
+
+    async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        self.lstat(id, path).await
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        self.lstat(id, handle[2..].to_string()).await
+    }
+
+    async fn setstat(&mut self, id: u32, path: String, a: FileAttributes) -> Result<Status, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        let n = fs.get_mut(&path).ok_or(StatusCode::NoSuchFile)?;
+        if let Some(t) = a.mtime {
+            n.mtime = t;
+        }
+        if let Some(p) = a.permissions {
+            n.mode = p & 0o7777;
+        }
+        Ok(status(id, StatusCode::Ok))
+    }
+
+    async fn fsetstat(&mut self, id: u32, handle: String, a: FileAttributes) -> Result<Status, Self::Error> {
+        self.setstat(id, handle[2..].to_string(), a).await
+    }
+
+    async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+        let fs = self.fs.lock().unwrap();
+        if !matches!(fs.get(&path).map(|n| &n.kind), Some(NodeKind::Dir)) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        let h = format!("d:{path}");
+        self.cursors.insert(h.clone(), 0);
+        Ok(Handle { id, handle: h })
+    }
+
+    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        self.counters.readdir.fetch_add(1, Ordering::SeqCst);
+        let fs = self.fs.lock().unwrap();
+        let list = children(&fs, &handle[2..], false);
+        let pos = *self.cursors.get(&handle).ok_or(StatusCode::BadMessage)?;
+        if pos >= list.len() {
+            return Err(StatusCode::Eof);
+        }
+        let page: Vec<File> = list[pos..(pos + self.cfg.page).min(list.len())].iter().map(|(p, n)| File::new(p.rsplit('/').next().unwrap(), attrs(n))).collect();
+        self.cursors.insert(handle, pos + page.len());
+        Ok(Name { id, files: page })
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        match fs.get(&filename).map(|n| &n.kind) {
+            Some(NodeKind::Dir) | None => Err(StatusCode::NoSuchFile),
+            _ => {
+                fs.remove(&filename);
+                Ok(status(id, StatusCode::Ok))
+            }
+        }
+    }
+
+    async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        if fs.contains_key(&path) {
+            return Err(StatusCode::Failure);
+        }
+        fs.insert(path, Node { kind: NodeKind::Dir, mode: 0o755, mtime: 1_700_000_200 });
+        Ok(status(id, StatusCode::Ok))
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        if !children(&fs, &path, false).is_empty() {
+            return Err(StatusCode::Failure);
+        }
+        fs.remove(&path).map(|_| status(id, StatusCode::Ok)).ok_or(StatusCode::NoSuchFile)
+    }
+
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        Ok(Name { id, files: vec![File::dummy(if path.is_empty() || path == "." { "/" } else { &path })] })
+    }
+
+    async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, Self::Error> {
+        let mut fs = self.fs.lock().unwrap();
+        let n = fs.remove(&oldpath).ok_or(StatusCode::NoSuchFile)?;
+        fs.insert(newpath, n);
+        Ok(status(id, StatusCode::Ok))
+    }
+}
+
+fn start(exec: ExecMode, fail: ExecFail, page: usize) -> Mock {
+    start_auth(exec, fail, page, AuthMode::default())
+}
+
+fn start_auth(exec: ExecMode, fail: ExecFail, page: usize, auth: AuthMode) -> Mock {
+    let fs = fixture();
+    let counters = Arc::new(Counters::default());
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    let server = MockServer { fs: fs.clone(), cfg: Arc::new(MockCfg { exec, fail, page, auth }), counters: counters.clone() };
+    let host_private = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519).unwrap();
+    let host_key = host_private.public_key().to_openssh().unwrap();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            use russh::server::Server as _;
+            let config = Arc::new(russh::server::Config { auth_rejection_time: Duration::from_millis(1), auth_rejection_time_initial: Some(Duration::ZERO), keys: vec![host_private], ..Default::default() });
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            let mut server = server;
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+    });
+    Mock { host_key, port, fs, counters, _thread: thread }
+}
+
+// ---------------------------------------------------------------- plugin driver
+
+struct Plugin {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next: u64,
+    /// The wire lines the plugin logged (`PATHFM_PLUGIN_LOG`), kept out of `req`'s frames.
+    log: Vec<String>,
+}
+
+impl Plugin {
+    fn spawn() -> Plugin {
+        Plugin::spawn_with(None)
+    }
+
+    /// `known_hosts` points the plugin at a fixture instead of the real `~/.ssh/known_hosts`.
+    fn spawn_with(known_hosts: Option<&std::path::Path>) -> Plugin {
+        Plugin::spawn_all(known_hosts, false)
+    }
+
+    /// With the library log asked for, as the daemon asks: `Log` events between the frames.
+    fn spawn_logging() -> Plugin {
+        Plugin::spawn_all(None, true)
+    }
+
+    fn spawn_all(known_hosts: Option<&std::path::Path>, log: bool) -> Plugin {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_path-plugin-sftp"));
+        if log {
+            cmd.env("PATHFM_PLUGIN_LOG", "1");
+        }
+        match known_hosts {
+            Some(p) => {
+                cmd.env("PATHFM_KNOWN_HOSTS", p);
+            }
+            None => {
+                cmd.env("PATHFM_KNOWN_HOSTS", "/nonexistent/known_hosts");
+            }
+        }
+        // Never the developer's own ~/.ssh: with no key named the plugin offers every key it
+        // finds, and a test must neither depend on those nor hand them to anything.
+        cmd.env("PATHFM_SSH_DIR", std::env::var("PATHFM_TEST_SSH_DIR").unwrap_or_else(|_| "/nonexistent/ssh".into()));
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().expect("spawn plugin");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Plugin { child, stdin, stdout, next: 1, log: Vec::new() }
+    }
+
+    /// Sends a request; returns (streamed JSON frames, final reply).
+    fn req(&mut self, mut v: Value) -> (Vec<Value>, Value) {
+        let id = self.next;
+        self.next += 1;
+        if let Value::Obj(m) = &mut v {
+            m.insert("id".into(), Value::Uint(id));
+        }
+        write_json(&mut self.stdin, &v).unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let (kind, payload) = read_frame(&mut self.stdout).unwrap().expect("plugin closed its stdout");
+            assert_eq!(kind, 0, "unexpected binary frame");
+            let f = json::parse(&payload).unwrap();
+            if f.str_field("event") == Some("Log") {
+                if f.str_field("target") == Some("wire") {
+                    self.log.push(f.str_field("message").unwrap_or("").to_string());
+                }
+                continue;
+            }
+            if f.get("ok").is_some() || f.get("err").is_some() {
+                assert_eq!(f.u64_field("id"), Some(id));
+                return (frames, f);
+            }
+            frames.push(f);
+        }
+    }
+
+    fn ok(&mut self, v: Value) -> Value {
+        let (_, r) = self.req(v);
+        r.get("ok").unwrap_or_else(|| panic!("expected ok, got {}", json::to_string(&r))).clone()
+    }
+
+    /// Connect with extra config keys — a pinned fingerprint, say.
+    fn connect_cfg(&mut self, port: u16, password: &str, extra: &[(&str, &str)]) -> Value {
+        let mut cfg = Value::obj().s("host", "127.0.0.1").s("port", port.to_string()).s("username", "path");
+        for (k, v) in extra {
+            cfg = cfg.s(k, *v);
+        }
+        let (_, r) = self.req(Value::obj().s("type", "Connect").s("location", "lab").s("role", "browse").v("config", cfg.done()).v("secrets", Value::obj().s("password", password).done()).done());
+        r
+    }
+
+    fn connect(&mut self, port: u16, password: &str) -> Value {
+        let cfg = Value::obj().s("host", "127.0.0.1").s("port", port.to_string()).s("username", "path").done();
+        let (_, r) = self.req(Value::obj().s("type", "Connect").s("location", "lab").s("role", "browse").v("config", cfg).v("secrets", Value::obj().s("password", password).done()).done());
+        r
+    }
+
+    fn scan(&mut self, path: &str, recursive: bool) -> Vec<Value> {
+        let (frames, r) = self.req(Value::obj().s("type", "Scan").s("location", "lab").s("path", path).b("recursive", recursive).done());
+        assert!(r.get("ok").is_some(), "scan failed: {}", json::to_string(&r));
+        let entries: Vec<Value> = frames.iter().flat_map(|f| f.get("entries").and_then(Value::as_arr).unwrap_or(&[]).to_vec()).collect();
+        assert_eq!(r.get("ok").unwrap().u64_field("n"), Some(entries.len() as u64), "n must equal the streamed entry count");
+        entries
+    }
+
+    fn read(&mut self, path: &str, offset: u64) -> Vec<u8> {
+        let id = self.next;
+        self.next += 1;
+        write_json(&mut self.stdin, &Value::obj().u("id", id).s("type", "Read").s("location", "lab").s("path", path).u("offset", offset).done()).unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let (kind, payload) = read_frame(&mut self.stdout).unwrap().expect("eof");
+            assert_eq!(kind, 1);
+            if payload.is_empty() {
+                break;
+            }
+            bytes.extend_from_slice(&payload);
+        }
+        let (kind, payload) = read_frame(&mut self.stdout).unwrap().expect("eof");
+        assert_eq!(kind, 0);
+        let r = json::parse(&payload).unwrap();
+        assert!(r.get("ok").is_some(), "read failed: {}", json::to_string(&r));
+        assert_eq!(r.get("ok").unwrap().u64_field("bytes"), Some(bytes.len() as u64));
+        bytes
+    }
+
+    fn write(&mut self, path: &str, data: &[u8], mtime: u64) -> Value {
+        let id = self.next;
+        self.next += 1;
+        write_json(&mut self.stdin, &Value::obj().u("id", id).s("type", "Write").s("location", "lab").s("path", path).u("size", data.len() as u64).u("mtime", mtime).done()).unwrap();
+        for c in data.chunks(200_000) {
+            write_binary(&mut self.stdin, c).unwrap();
+        }
+        write_binary(&mut self.stdin, &[]).unwrap();
+        self.stdin.flush().unwrap();
+        let (kind, payload) = read_frame(&mut self.stdout).unwrap().expect("eof");
+        assert_eq!(kind, 0);
+        json::parse(&payload).unwrap()
+    }
+}
+
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        let _ = write_json(&mut self.stdin, &Value::obj().u("id", 999_999).s("type", "Shutdown").done());
+        let _ = self.child.wait();
+    }
+}
+
+/// Listing shape that both scan paths must agree on.
+fn normalise(entries: &[Value]) -> Vec<(String, String, u64, u64, u64, String)> {
+    let mut v: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            let m = e.get("meta").expect("meta inline");
+            (
+                e.str_field("name").unwrap().to_string(),
+                e.str_field("kind").unwrap().to_string(),
+                m.u64_field("size").unwrap(),
+                m.u64_field("mtime").unwrap(),
+                m.u64_field("mode").unwrap(),
+                e.str_field("rel").unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn fast_scan(p: &mut Plugin) -> String {
+    p.ok(Value::obj().s("type", "Capabilities").s("location", "lab").done()).str_field("fastScan").unwrap().to_string()
+}
+
+fn connected(exec: ExecMode, fail: ExecFail, page: usize) -> (Mock, Plugin) {
+    let m = start(exec, fail, page);
+    let mut p = Plugin::spawn();
+    let r = p.connect(m.port, "secret");
+    assert!(r.get("ok").is_some(), "connect: {}", json::to_string(&r));
+    assert!(r.get("ok").unwrap().str_field("fingerprint").is_some(), "fingerprint reported on first use");
+    (m, p)
+}
+
+// ---------------------------------------------------------------- tests
+
+#[test]
+fn gnu_fast_scan_lists_in_one_round_trip_and_matches_readdir() {
+    let (m, mut p) = connected(ExecMode::Gnu, ExecFail::None, 2);
+    assert_eq!(fast_scan(&mut p), "gnu");
+    let root_fast = p.scan("/", false);
+    assert_eq!(m.counters.readdir.load(Ordering::SeqCst), 0, "GNU mode must not touch READDIR");
+    let names: Vec<&str> = root_fast.iter().map(|e| e.str_field("name").unwrap()).collect();
+    assert!(names.contains(&"we ird'na\nme.txt"), "newline, quote and space survive: {names:?}");
+    let link = root_fast.iter().find(|e| e.str_field("name") == Some("link")).unwrap();
+    assert_eq!(link.str_field("kind"), Some("link"), "symlinks are listed as links, never followed");
+
+    // Whole tree in one exec: rel paths, no name collisions.
+    let tree = p.scan("/docs", true);
+    let rels: Vec<&str> = tree.iter().map(|e| e.str_field("rel").unwrap()).collect();
+    assert_eq!(rels, vec!["readme.md", "sub", "sub/deep.txt"]);
+
+    // Same server, exec refused: READDIR gives an identical listing, paged 2 at a time.
+    let (m2, mut q) = connected(ExecMode::Refused, ExecFail::None, 2);
+    assert_eq!(fast_scan(&mut q), "none");
+    let root_slow = q.scan("/", false);
+    assert_eq!(normalise(&root_fast), normalise(&root_slow));
+    assert!(m2.counters.readdir.load(Ordering::SeqCst) >= 3, "5 entries at 2 per page");
+    let (_, r) = q.req(Value::obj().s("type", "Scan").s("location", "lab").s("path", "/docs").b("recursive", true).done());
+    assert_eq!(r.get("err").unwrap().str_field("code"), Some("Unsupported"), "recursive scan needs exec; the daemon walks per directory instead");
+}
+
+#[test]
+fn posix_stat_fallbacks_match_readdir() {
+    let (_m0, mut q) = connected(ExecMode::Refused, ExecFail::None, 100);
+    let reference = normalise(&q.scan("/", false));
+    let reference_tree = normalise(&q_tree(&mut q));
+    for mode in [ExecMode::StatC, ExecMode::StatF] {
+        let (m, mut p) = connected(mode, ExecFail::None, 100);
+        assert_eq!(fast_scan(&mut p), "posix", "{mode:?}");
+        assert_eq!(normalise(&p.scan("/", false)), reference, "{mode:?}");
+        assert_eq!(m.counters.readdir.load(Ordering::SeqCst), 0, "{mode:?} must not touch READDIR");
+        assert_eq!(normalise(&p.scan("/docs", true)), reference_tree, "{mode:?} recursive");
+    }
+    // exec works but there is no find at all
+    let (_m, mut p) = connected(ExecMode::NoFind, ExecFail::None, 100);
+    assert_eq!(fast_scan(&mut p), "none");
+    assert_eq!(normalise(&p.scan("/", false)), reference);
+}
+
+/// The reference tree for a READDIR-only server: walk it by hand, one Scan per directory.
+fn q_tree(q: &mut Plugin) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (dir, prefix) in [("/docs", ""), ("/docs/sub", "sub/")] {
+        for mut e in q.scan(dir, false) {
+            let rel = format!("{prefix}{}", e.str_field("name").unwrap());
+            if let Value::Obj(m) = &mut e {
+                m.insert("rel".into(), Value::Str(rel));
+            }
+            out.push(e);
+        }
+    }
+    out
+}
+
+#[test]
+fn killed_exec_stream_falls_back_without_duplicates() {
+    let (m, mut p) = connected(ExecMode::Gnu, ExecFail::KillAfter(40), 100);
+    assert_eq!(fast_scan(&mut p), "gnu");
+    let listing = p.scan("/", false);
+    let names: Vec<&str> = listing.iter().map(|e| e.str_field("name").unwrap()).collect();
+    let mut dedup = names.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), names.len(), "no duplicate entries after fallback: {names:?}");
+    assert_eq!(names.len(), 5, "complete listing over READDIR: {names:?}");
+    assert!(m.counters.readdir.load(Ordering::SeqCst) >= 1);
+    // Fast scan is off for the rest of the session: the next listing goes straight to READDIR.
+    assert_eq!(fast_scan(&mut p), "none");
+    let execs = m.counters.execs.load(Ordering::SeqCst);
+    p.scan("/docs", false);
+    assert_eq!(m.counters.execs.load(Ordering::SeqCst), execs, "no further exec attempts");
+}
+
+#[test]
+fn find_exit_status_one_is_still_a_listing() {
+    let (m, mut p) = connected(ExecMode::Gnu, ExecFail::ExitOne, 100);
+    let listing = p.scan("/", false);
+    assert_eq!(listing.len(), 5);
+    assert_eq!(m.counters.readdir.load(Ordering::SeqCst), 0);
+    assert_eq!(fast_scan(&mut p), "gnu", "an unreadable entry does not disable fast scan");
+}
+
+#[test]
+fn reads_are_pipelined_and_exact() {
+    let (m, mut p) = connected(ExecMode::Refused, ExecFail::None, 100);
+    let expect = pseudo_random(4 * 1024 * 1024 + 12_345);
+    let got = p.read("/data.bin", 0);
+    assert_eq!(got.len(), expect.len());
+    assert!(got == expect, "bytes differ");
+    let reads = m.counters.reads.load(Ordering::SeqCst);
+    // This server gives at most 50 000 bytes a read, and 64 KiB is asked for: every chunk comes
+    // back short and is followed up once. 64 full chunks × 2, the 12 345-byte tail, and the read
+    // after it that is told "end of file". What matters is the line above — the bytes are exact;
+    // against OpenSSH, which also gives less than it is asked, they used to stop at 255 KiB.
+    assert_eq!(reads, 130, "64 KiB chunks, each answered short and followed up");
+    assert!(m.counters.max_inflight.load(Ordering::SeqCst) >= 8, "requests overlap on the wire: max in flight {}", m.counters.max_inflight.load(Ordering::SeqCst));
+    // Resume from an offset (partialRead)
+    let tail = p.read("/data.bin", 4 * 1024 * 1024);
+    assert_eq!(tail, &expect[4 * 1024 * 1024..]);
+    // Small file, and a missing one is a typed error
+    assert_eq!(p.read("/docs/readme.md", 0), b"hello");
+    let id = p.next;
+    p.next += 1;
+    write_json(&mut p.stdin, &Value::obj().u("id", id).s("type", "Read").s("location", "lab").s("path", "/nope").done()).unwrap();
+    let (kind, payload) = read_frame(&mut p.stdout).unwrap().unwrap();
+    assert_eq!((kind, payload.len()), (1, 0), "end marker even on failure");
+    let (_, payload) = read_frame(&mut p.stdout).unwrap().unwrap();
+    assert_eq!(json::parse(&payload).unwrap().get("err").unwrap().str_field("code"), Some("NotFound"));
+}
+
+#[test]
+fn the_connection_log_carries_the_wire() {
+    let m = start(ExecMode::Gnu, ExecFail::None, 100);
+    let mut p = Plugin::spawn_logging();
+    let r = p.connect(m.port, "secret");
+    assert!(r.get("ok").is_some(), "connect: {}", json::to_string(&r));
+    p.scan("/", false);
+    assert!(p.log.iter().any(|l| l.starts_with("→ exec find ")), "the fast scan's command: {:?}", p.log);
+    assert!(p.log.iter().any(|l| l.starts_with("← exit 0, ") && l.ends_with(" entries")), "and its answer: {:?}", p.log);
+    p.ok(Value::obj().s("type", "Stat").s("location", "lab").s("path", "/").done());
+    assert!(p.log.contains(&"→ LSTAT /".to_string()), "{:?}", p.log);
+    assert!(p.log.iter().any(|l| l.starts_with("← ") && l.contains("mode 755")), "{:?}", p.log);
+    p.ok(Value::obj().s("type", "Mkdir").s("location", "lab").s("path", "/wired").done());
+    assert!(p.log.contains(&"→ MKDIR /wired".to_string()), "{:?}", p.log);
+    let (_, r) = p.req(Value::obj().s("type", "Stat").s("location", "lab").s("path", "/nope").done());
+    assert!(r.get("err").is_some());
+    let last = p.log.last().cloned().unwrap_or_default();
+    assert!(last.starts_with("← ") && !last.contains("mode"), "a refusal is the server's own words: {last}");
+    assert!(!p.log.iter().any(|l| l.contains("secret")), "no secret on the wire: {:?}", p.log);
+    drop(m);
+}
+
+#[test]
+fn write_and_metadata_operations_round_trip() {
+    let (m, mut p) = connected(ExecMode::Gnu, ExecFail::None, 100);
+    let data = pseudo_random(1_000_003);
+    let r = p.write("/upload.bin", &data, 1_600_000_000_000);
+    assert_eq!(r.get("ok").unwrap().u64_field("bytes"), Some(data.len() as u64), "{}", json::to_string(&r));
+    {
+        let fs = m.fs.lock().unwrap();
+        let n = fs.get("/upload.bin").unwrap();
+        assert!(matches!(&n.kind, NodeKind::File(b) if *b == data));
+        assert_eq!(n.mtime, 1_600_000_000, "mtime applied after the write");
+    }
+    let st = p.ok(Value::obj().s("type", "Stat").s("location", "lab").s("path", "/upload.bin").done());
+    assert_eq!(st.u64_field("size"), Some(data.len() as u64));
+    assert_eq!(st.u64_field("mtime"), Some(1_600_000_000_000));
+
+    p.ok(Value::obj().s("type", "Mkdir").s("location", "lab").s("path", "/made").done());
+    p.ok(Value::obj().s("type", "Rename").s("location", "lab").s("from", "/upload.bin").s("to", "/made/upload.bin").done());
+    p.ok(Value::obj().s("type", "Chmod").s("location", "lab").s("path", "/made/upload.bin").u("mode", 0o600).done());
+    p.ok(Value::obj().s("type", "SetMtime").s("location", "lab").s("path", "/made/upload.bin").u("mtime", 1_500_000_000_000).done());
+    let st = p.ok(Value::obj().s("type", "Stat").s("location", "lab").s("path", "/made/upload.bin").done());
+    assert_eq!(st.u64_field("mode"), Some(0o600));
+    assert_eq!(st.u64_field("mtime"), Some(1_500_000_000_000));
+    // The fast listing sees the same
+    let made = p.scan("/made", false);
+    assert_eq!(made.len(), 1);
+    assert_eq!(made[0].get("meta").unwrap().u64_field("mode"), Some(0o600));
+
+    p.ok(Value::obj().s("type", "Delete").s("location", "lab").s("path", "/made/upload.bin").done());
+    p.ok(Value::obj().s("type", "Delete").s("location", "lab").s("path", "/made").done());
+    assert!(!m.fs.lock().unwrap().contains_key("/made"));
+    let (_, r) = p.req(Value::obj().s("type", "Stat").s("location", "lab").s("path", "/made").done());
+    assert_eq!(r.get("err").unwrap().str_field("code"), Some("NotFound"));
+}
+
+#[test]
+fn wrong_password_is_an_auth_error_and_validate_checks_fields() {
+    let m = start(ExecMode::Gnu, ExecFail::None, 100);
+    let mut p = Plugin::spawn();
+    let r = p.connect(m.port, "nope");
+    assert_eq!(r.get("err").unwrap().str_field("code"), Some("Auth"), "{}", json::to_string(&r));
+    let (_, r) = p.req(Value::obj().s("type", "Validate").v("config", Value::obj().s("host", "h").s("username", "u").s("port", "70000").done()).done());
+    assert_eq!(r.get("err").unwrap().str_field("field"), Some("port"));
+    let (_, r) = p.req(Value::obj().s("type", "Validate").v("config", Value::obj().s("host", "").s("username", "u").done()).done());
+    assert_eq!(r.get("err").unwrap().str_field("field"), Some("host"));
+    let d = p.ok(Value::obj().s("type", "Describe").done());
+    assert_eq!(d.str_field("scheme"), Some("sftp"));
+    assert_eq!(d.get("features").unwrap().get("pipelining").and_then(Value::as_bool), Some(true));
+}
+
+// ---------------------------------------------------------------- host keys
+
+/// A known_hosts fixture: `[127.0.0.1]:port <key>`, which is how ssh records a non-22 port.
+fn known_hosts_file(name: &str, port: u16, key: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("path-known-hosts-{}-{name}", std::process::id()));
+    std::fs::write(&p, format!("[127.0.0.1]:{port} {key}\n")).unwrap();
+    p
+}
+
+/// ssh already knows this host and this key: that is a verification the user has done once, by
+/// hand, so path honours it and does not ask a second time.
+#[test]
+fn a_host_in_known_hosts_is_accepted_and_reported() {
+    let m = start(ExecMode::Refused, ExecFail::None, 0);
+    let kh = known_hosts_file("match", m.port, &m.host_key);
+    let mut p = Plugin::spawn_with(Some(&kh));
+    let r = p.connect(m.port, "secret");
+    let ok = r.get("ok").unwrap_or_else(|| panic!("connect failed: {}", json::to_string(&r)));
+    assert_eq!(ok.get("knownHost").and_then(Value::as_bool), Some(true), "known_hosts vouches for this key");
+    assert!(ok.str_field("fingerprint").is_some());
+    let _ = std::fs::remove_file(kh);
+}
+
+/// A host ssh has never seen is connected to, and the key is handed back: path asks the user
+/// before it saves anything.
+#[test]
+fn an_unknown_host_is_reported_for_the_user_to_verify() {
+    let m = start(ExecMode::Refused, ExecFail::None, 0);
+    let mut p = Plugin::spawn_with(None);
+    let ok = p.connect(m.port, "secret").get("ok").cloned().expect("connect");
+    assert_eq!(ok.get("knownHost").and_then(Value::as_bool), Some(false));
+    assert!(ok.str_field("fingerprint").unwrap().starts_with("SHA256:"));
+}
+
+/// known_hosts has a different key of the same kind for this host — ssh's "identification has
+/// changed". path refuses, and says which record disagrees.
+#[test]
+fn a_key_that_known_hosts_disagrees_with_is_refused() {
+    let m = start(ExecMode::Refused, ExecFail::None, 0);
+    let other = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519).unwrap().public_key().to_openssh().unwrap();
+    let kh = known_hosts_file("changed", m.port, &other);
+    let mut p = Plugin::spawn_with(Some(&kh));
+    let r = p.connect(m.port, "secret");
+    let err = r.get("err").unwrap_or_else(|| panic!("expected a refusal, got {}", json::to_string(&r)));
+    assert_eq!(err.str_field("code"), Some("Auth"));
+    let msg = err.str_field("message").unwrap_or("");
+    assert!(msg.contains("known_hosts"), "{msg}");
+    assert!(msg.contains("has changed"), "{msg}");
+    let _ = std::fs::remove_file(kh);
+}
+
+/// Once the user has accepted a key it is pinned in the location, and only that key will do.
+#[test]
+fn a_pinned_key_must_match() {
+    let m = start(ExecMode::Refused, ExecFail::None, 0);
+    let mut p = Plugin::spawn_with(None);
+    let fp = p.connect(m.port, "secret").get("ok").cloned().expect("connect").str_field("fingerprint").unwrap().to_string();
+    p.ok(Value::obj().s("type", "Disconnect").s("location", "lab").s("role", "browse").done());
+
+    // The key it offers: accepted.
+    let mut good = Plugin::spawn_with(None);
+    let ok = good.connect_cfg(m.port, "secret", &[("trustedFingerprint", &fp)]).get("ok").cloned();
+    assert!(ok.is_some(), "the pinned key is the one the server has");
+
+    // Any other: refused, naming what this location trusts.
+    let mut bad = Plugin::spawn_with(None);
+    let r = bad.connect_cfg(m.port, "secret", &[("trustedFingerprint", "SHA256:not-this-one")]);
+    let err = r.get("err").unwrap_or_else(|| panic!("expected a refusal, got {}", json::to_string(&r)));
+    assert_eq!(err.str_field("code"), Some("Auth"));
+    assert!(err.str_field("message").unwrap_or("").contains("this location trusts SHA256:not-this-one"));
+}
+
+// ---------------------------------------------------------------- signing in
+
+/// A throwaway ~/.ssh with the named keys in it; returns the directory and each public key.
+fn ssh_dir_with(tag: &str, keys: &[(&str, &str)]) -> Option<(std::path::PathBuf, Vec<String>)> {
+    let d = std::env::temp_dir().join(format!("path-sftp-auth-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let mut publics = Vec::new();
+    for (name, passphrase) in keys {
+        let ok = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", passphrase, "-C", name, "-f"]).arg(d.join(name)).status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            eprintln!("ssh-keygen not available; skipped");
+            return None;
+        }
+        publics.push(std::fs::read_to_string(d.join(format!("{name}.pub"))).unwrap().trim().to_string());
+    }
+    Some((d, publics))
+}
+
+/// The plugin under a given ~/.ssh. Serialised: the directory is handed over in the environment.
+static SSH_ENV: Mutex<()> = Mutex::new(());
+fn plugin_with_ssh_dir(dir: &std::path::Path) -> Plugin {
+    std::env::set_var("PATHFM_TEST_SSH_DIR", dir);
+    let p = Plugin::spawn();
+    std::env::remove_var("PATHFM_TEST_SSH_DIR");
+    p
+}
+
+fn connect_with(p: &mut Plugin, port: u16, identity: Option<&str>, secrets: Value) -> Value {
+    let mut cfg = Value::obj().s("host", "127.0.0.1").s("port", port.to_string()).s("username", "path");
+    if let Some(i) = identity {
+        cfg = cfg.s("identityFile", i);
+    }
+    let (_, r) = p.req(Value::obj().s("type", "Connect").s("location", "lab").s("role", "browse").v("config", cfg.done()).v("secrets", secrets).done());
+    r
+}
+
+#[test]
+fn several_named_keys_are_offered_in_order_until_one_is_taken() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, publics)) = ssh_dir_with("several", &[("id_ed25519", ""), ("other", "")]) else { return };
+    // The server knows only the SECOND key named: the first is refused and the next one offered.
+    let m = start_auth(ExecMode::Gnu, ExecFail::None, 100, AuthMode { authorized: vec![publics[1].clone()], ..Default::default() });
+    let mut p = plugin_with_ssh_dir(&dir);
+    let both = format!("{}\n{}", dir.join("id_ed25519").to_string_lossy(), dir.join("other").to_string_lossy());
+    let r = connect_with(&mut p, m.port, Some(&both), Value::obj().done());
+    assert!(r.get("ok").is_some(), "{}", json::to_string(&r));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No key named is no key offered, though one the server would take is sitting in ~/.ssh: which
+/// keys to use is chosen in the form, not found behind the user's back.
+#[test]
+fn no_key_named_offers_none_even_when_one_would_work() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, publics)) = ssh_dir_with("unnamed", &[("id_ed25519", "")]) else { return };
+    let m = start_auth(ExecMode::Gnu, ExecFail::None, 100, AuthMode { authorized: publics.clone(), ..Default::default() });
+    let mut p = plugin_with_ssh_dir(&dir);
+    OFFERED.lock().unwrap().clear();
+    let r = connect_with(&mut p, m.port, None, Value::obj().done());
+    assert!(r.get("err").unwrap().str_field("message").unwrap_or("").contains("nothing to sign in with"), "{}", json::to_string(&r));
+    assert!(OFFERED.lock().unwrap().is_empty(), "no key was named, so none may be offered");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_named_key_is_the_only_one_offered() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, publics)) = ssh_dir_with("named", &[("id_ed25519", ""), ("work", "")]) else { return };
+    let m = start_auth(ExecMode::Gnu, ExecFail::None, 100, AuthMode { authorized: vec![publics[0].clone()], ..Default::default() });
+    let mut p = plugin_with_ssh_dir(&dir);
+    // `work` is named and the server does not know it: the key it DOES know is sitting right
+    // there in the directory and must not be tried, because it was not chosen.
+    OFFERED.lock().unwrap().clear();
+    let r = connect_with(&mut p, m.port, Some(&dir.join("work").to_string_lossy()), Value::obj().done());
+    let err = r.get("err").unwrap_or_else(|| panic!("expected a refusal, got {}", json::to_string(&r)));
+    assert_eq!(err.str_field("code"), Some("Auth"));
+    assert!(err.str_field("message").unwrap_or("").contains("the key work"), "{}", json::to_string(&r));
+    let blob = |k: &str| k.split_whitespace().nth(1).unwrap_or("").to_string();
+    let offered: Vec<String> = OFFERED.lock().unwrap().iter().map(|k| blob(k)).collect();
+    assert!(offered.contains(&blob(&publics[1])) && !offered.contains(&blob(&publics[0])), "offered {offered:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_encrypted_key_needs_its_passphrase_and_says_so() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, publics)) = ssh_dir_with("locked", &[("locked", "open sesame")]) else { return };
+    let m = start_auth(ExecMode::Gnu, ExecFail::None, 100, AuthMode { authorized: publics.clone(), ..Default::default() });
+    let mut p = plugin_with_ssh_dir(&dir);
+    let locked = dir.join("locked").to_string_lossy().to_string();
+    let r = connect_with(&mut p, m.port, Some(&locked), Value::obj().done());
+    assert!(r.get("err").unwrap().str_field("message").unwrap_or("").contains("locked: needs its passphrase"), "{}", json::to_string(&r));
+    let r = connect_with(&mut p, m.port, Some(&locked), Value::obj().s("passphrase", "wrong").done());
+    assert!(r.get("err").unwrap().str_field("message").unwrap_or("").contains("locked: wrong passphrase"), "{}", json::to_string(&r));
+    let r = connect_with(&mut p, m.port, Some(&locked), Value::obj().s("passphrase", "open sesame").done());
+    assert!(r.get("ok").is_some(), "{}", json::to_string(&r));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_password_signs_in_when_every_key_is_refused() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, _)) = ssh_dir_with("fallback", &[("id_ed25519", "")]) else { return };
+    let m = start(ExecMode::Gnu, ExecFail::None, 100); // knows no keys at all
+    let mut p = plugin_with_ssh_dir(&dir);
+    let r = connect_with(&mut p, m.port, Some(&dir.join("id_ed25519").to_string_lossy()), Value::obj().s("password", "secret").done());
+    assert!(r.get("ok").is_some(), "{}", json::to_string(&r));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plenty of servers refuse the `password` method and ask through PAM instead. The same
+/// password has to work there, or "username and password" is a promise the form cannot keep.
+#[test]
+fn a_password_answers_a_keyboard_interactive_server() {
+    let m = start_auth(ExecMode::Gnu, ExecFail::None, 100, AuthMode { no_password_method: true, interactive: true, ..Default::default() });
+    let mut p = Plugin::spawn();
+    let r = p.connect(m.port, "secret");
+    assert!(r.get("ok").is_some(), "{}", json::to_string(&r));
+
+    let mut q = Plugin::spawn();
+    let r = q.connect(m.port, "nope");
+    let err = r.get("err").unwrap();
+    assert_eq!(err.str_field("code"), Some("Auth"));
+    assert!(err.str_field("message").unwrap_or("").contains("the password"), "{}", json::to_string(&r));
+}
+
+#[test]
+fn nothing_to_sign_in_with_says_so() {
+    let m = start(ExecMode::Gnu, ExecFail::None, 100);
+    let mut p = Plugin::spawn(); // no keys to find, no password
+    let r = connect_with(&mut p, m.port, None, Value::obj().done());
+    assert!(r.get("err").unwrap().str_field("message").unwrap_or("").contains("nothing to sign in with"), "{}", json::to_string(&r));
+}
+
+#[test]
+fn browse_lists_the_keys_for_the_form() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, _)) = ssh_dir_with("browse", &[("id_ed25519", ""), ("work", "pw")]) else { return };
+    let mut p = plugin_with_ssh_dir(&dir);
+    let r = p.ok(Value::obj().s("type", "Browse").s("field", "identityFile").v("config", Value::obj().done()).v("secrets", Value::obj().done()).done());
+    let options = r.get("options").and_then(Value::as_arr).expect("options").to_vec();
+    let labels: Vec<&str> = options.iter().filter_map(|o| o.str_field("label")).collect();
+    assert_eq!(labels, vec!["id_ed25519 · ED25519 · id_ed25519", "work · ED25519 · work · passphrase"]);
+    assert_eq!(options[0].str_field("value"), Some(dir.join("id_ed25519").to_string_lossy().as_ref()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Password tab: a key the server would take is named too (left over from the other tab),
+/// and must not be offered — the location says how it signs in.
+#[test]
+fn the_password_tab_offers_no_key_and_the_key_tab_sends_no_password() {
+    let _g = SSH_ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((dir, publics)) = ssh_dir_with("tabs", &[("id_ed25519", "")]) else { return };
+    let key = dir.join("id_ed25519").to_string_lossy().to_string();
+    let connect = |p: &mut Plugin, port: u16, auth: &str, secrets: Value| {
+        let cfg = Value::obj().s("host", "127.0.0.1").s("port", port.to_string()).s("username", "path").s("identityFile", &key).s("auth", auth).done();
+        let (_, r) = p.req(Value::obj().s("type", "Connect").s("location", "lab").s("role", "browse").v("config", cfg).v("secrets", secrets).done());
+        r
+    };
+    // A server that takes the key AND the password.
+    let m = start_auth(ExecMode::Gnu, ExecFail::None, 100, AuthMode { authorized: publics.clone(), ..Default::default() });
+    let mut p = plugin_with_ssh_dir(&dir);
+    OFFERED.lock().unwrap().clear();
+    let r = connect(&mut p, m.port, "password", Value::obj().s("password", "secret").done());
+    assert!(r.get("ok").is_some(), "{}", json::to_string(&r));
+    assert!(OFFERED.lock().unwrap().is_empty(), "the Password tab offers no key");
+
+    // The Key tab with a wrong key for this server and the RIGHT password lying about: refused.
+    let m2 = start(ExecMode::Gnu, ExecFail::None, 100); // knows no keys; would take "secret"
+    let mut q = plugin_with_ssh_dir(&dir);
+    let r = connect(&mut q, m2.port, "key", Value::obj().s("password", "secret").done());
+    let err = r.get("err").unwrap_or_else(|| panic!("the Key tab must not fall back to the password: {}", json::to_string(&r)));
+    assert!(!err.str_field("message").unwrap_or("").contains("password"), "{}", json::to_string(&r));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A location's name can be given away: remove one and add another under the same name. The
+/// plugin keeps a session per name and role, so unless it compares the config it hands the new
+/// location the connection — and the SFTP channel — of the machine that was removed. (The daemon
+/// disconnects on remove; this is the plugin's own guard, and it holds even if something else
+/// ever forgets to.)
+#[test]
+fn a_name_reused_for_another_server_does_not_inherit_the_old_connection() {
+    let old = start(ExecMode::Gnu, ExecFail::None, 100);
+    let new = start(ExecMode::Gnu, ExecFail::None, 100);
+    new.fs.lock().unwrap().insert("/only-on-the-new-one.txt".into(), Node { kind: NodeKind::File(b"new".to_vec()), mode: 0o644, mtime: 1_700_000_009 });
+    let mut p = Plugin::spawn();
+
+    let first_reply = p.connect(old.port, "secret");
+    assert!(first_reply.get("ok").is_some(), "{}", json::to_string(&first_reply));
+    let first = normalise(&p.scan("/", false));
+    assert_eq!(old.counters.auths.load(Ordering::SeqCst), 1);
+
+    // The same details again: the session stands, and nobody signs in twice for nothing.
+    assert!(p.connect(old.port, "secret").get("ok").is_some());
+    assert_eq!(old.counters.auths.load(Ordering::SeqCst), 1, "the same server and sign-in reuses the session it has");
+    assert_eq!(normalise(&p.scan("/", false)), first);
+
+    // The same location name and role, another machine behind it — and another host key, which
+    // is the other half of the answer: a session handed back would report the old server's.
+    let reply = p.connect(new.port, "secret");
+    assert!(reply.get("ok").is_some(), "{}", json::to_string(&reply));
+    assert_eq!(new.counters.auths.load(Ordering::SeqCst), 1, "the new server was really connected to");
+    assert_ne!(reply.get("ok").unwrap().str_field("fingerprint"), first_reply.get("ok").unwrap().str_field("fingerprint"), "the key reported is the key of the server now being talked to");
+    let second = normalise(&p.scan("/", false));
+    assert!(second.iter().any(|e| e.0 == "only-on-the-new-one.txt"), "the listing is the new server's: {second:?}");
+    assert_ne!(first, second);
+
+    // A changed password on the same server is a new sign-in too, not the old connection.
+    let r = p.connect(new.port, "wrong");
+    assert_eq!(r.get("err").unwrap().str_field("code"), Some("Auth"), "{}", json::to_string(&r));
+}

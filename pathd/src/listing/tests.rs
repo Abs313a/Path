@@ -1,0 +1,733 @@
+//! The listing's tests: sorting, filtering, windows, watching and the cache.
+
+use crate::listing::deco;
+use crate::listing::*;
+use std::time::Duration;
+
+fn temp_tree(n: usize) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("path-listing-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    for i in 0..n {
+        std::fs::write(dir.join(format!("file{i}.txt")), vec![b'x'; i % 7]).unwrap();
+    }
+    dir
+}
+
+/// A folder deleted and recreated with the same name is a different folder: the cached
+/// listing holds a handle on the old inode, and reusing it shows the old contents (or
+/// nothing at all) for ever.
+#[test]
+fn a_recreated_folder_is_listed_afresh() {
+    let dir = std::env::temp_dir().join(format!("path-recreate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("before.txt"), b"before").unwrap();
+    let uri = Uri::from_path(&dir);
+
+    let (l, _) = open(&uri).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    assert_eq!(l.window(1, 1, 0, 10, None).u64_field("n"), Some(1));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("after-one.txt"), b"1").unwrap();
+    std::fs::write(dir.join("after-two.txt"), b"2").unwrap();
+
+    let (l2, cached) = open(&uri).unwrap();
+    assert!(!cached, "a replaced directory must not be served from the cache");
+    assert!(wait_scan(&l2, Duration::from_secs(5)));
+    let w = l2.window(1, 2, 0, 10, None);
+    assert_eq!(w.u64_field("n"), Some(2));
+    let rows = w.get("rows").unwrap().as_arr().unwrap();
+    assert_eq!(rows[0].str_field("name"), Some("after-one.txt"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_window_and_stats() {
+    let dir = temp_tree(50);
+    let uri = Uri::from_path(&dir);
+    let (l, cached) = open(&uri).unwrap();
+    assert!(!cached);
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let (tx, rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 1, lid: 7, tx, first: 0, count: 10, view_first: 0, view_count: 10 });
+    let w = l.window(1, 7, 0, 10, None);
+    assert_eq!(w.u64_field("n"), Some(51));
+    let rows = w.get("rows").unwrap().as_arr().unwrap();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0].str_field("name"), Some("sub")); // folders first
+    assert_eq!(rows[1].str_field("name"), Some("file0.txt")); // natural order
+    assert_eq!(rows[2].str_field("name"), Some("file1.txt"));
+    // small dir: enrichment lands soon; wait for a Rows event or metadata
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let w = l.window(1, 7, 0, 10, None);
+        let rows = w.get("rows").unwrap().as_arr().unwrap();
+        if rows[1].get("meta").map(|m| m != &Value::Null).unwrap_or(false) {
+            assert_eq!(rows[1].get("meta").unwrap().u64_field("size"), Some(0));
+            break;
+        }
+        assert!(Instant::now() < deadline, "metadata never arrived");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = drain(&rx);
+    // second open is served from the cache
+    let (_l2, cached) = open(&uri).unwrap();
+    assert!(cached);
+    // filter
+    assert_eq!(l.filter("file1"), 11); // file1, file10..file19
+    assert_eq!(l.filter(""), 51);
+    // sort by size descending waits for enrichment then resets
+    let (tx2, rx2) = mpsc::channel();
+    l.sort(SortRole::Size, false, Some((tx2, 99)));
+    let reply = rx2.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(reply.u64_field("id"), Some(99));
+    let w = l.window(1, 7, 0, 3, None);
+    let rows = w.get("rows").unwrap().as_arr().unwrap();
+    assert_eq!(rows[0].str_field("name"), Some("sub"));
+    assert_eq!(rows[1].get("meta").unwrap().u64_field("size"), Some(6));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn rescan_keeps_meta_for_unchanged() {
+    let dir = temp_tree(5);
+    let uri = Uri::from_path(&dir);
+    let (l, _) = open(&uri).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let (tx, rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 2, lid: 1, tx, first: 0, count: 10, view_first: 0, view_count: 10 });
+    l.enrich(None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while l.inner.lock().unwrap().meta.iter().any(Option::is_none) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::write(dir.join("new.txt"), b"1").unwrap();
+    l.rescan();
+    let w = l.window(2, 1, 0, 20, None);
+    let rows = w.get("rows").unwrap().as_arr().unwrap();
+    assert_eq!(rows.len(), 7);
+    let kept = rows.iter().find(|r| r.str_field("name") == Some("file1.txt")).unwrap();
+    assert!(kept.get("meta").unwrap() != &Value::Null);
+    let fresh = rows.iter().find(|r| r.str_field("name") == Some("new.txt")).unwrap();
+    assert_eq!(fresh.get("meta").unwrap(), &Value::Null);
+    let events = drain(&rx);
+    assert!(events.iter().any(|e| e.str_field("event") == Some("Reset")));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn dot_files_hidden_until_asked() {
+    let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("path-hidden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), b"a").unwrap();
+    std::fs::write(dir.join(".secret"), b"s").unwrap();
+    std::fs::create_dir(dir.join(".git")).unwrap();
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    assert_eq!(l.count().0, 1, "dot-files hidden by default");
+    assert_eq!(l.set_hidden(true), 3);
+    let w = l.window(1, 1, 0, 10, None);
+    let names: Vec<&str> = w.get("rows").unwrap().as_arr().unwrap().iter().map(|r| r.str_field("name").unwrap()).collect();
+    assert_eq!(names, vec![".git", ".secret", "a.txt"]); // folders first, then dot-files sort with the rest
+    assert_eq!(l.set_hidden(false), 1);
+    // type-ahead: prefix search over the view with wrap-around
+    std::fs::write(dir.join("Banana.txt"), b"b").unwrap();
+    std::fs::write(dir.join("apple.txt"), b"a").unwrap();
+    l.rescan();
+    assert_eq!(l.seek("ba", None), Some(2)); // a.txt, apple.txt, Banana.txt sorted naturally
+    assert_eq!(l.seek("a", None), Some(0));
+    assert_eq!(l.seek("a", Some(0)), Some(1));
+    assert_eq!(l.seek("a", Some(1)), Some(0), "wraps");
+    assert_eq!(l.seek("zz", None), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ------------------------------------------------------------ the view
+
+/// Sorting, filtering, hidden files and type-ahead all act on the same view, and each one
+/// renumbers it. These are the operations every keystroke in the window goes through.
+#[test]
+fn the_view_sorts_filters_and_seeks() {
+    let dir = std::env::temp_dir().join(format!("path-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Zed")).unwrap();
+    std::fs::write(dir.join("apple.txt"), vec![b'x'; 300]).unwrap();
+    std::fs::write(dir.join("Banana.md"), vec![b'x'; 10]).unwrap();
+    std::fs::write(dir.join("cherry.txt"), vec![b'x'; 100]).unwrap();
+    std::fs::write(dir.join(".hidden.txt"), b"h").unwrap();
+    let uri = Uri::from_path(&dir);
+    let (l, _) = open(&uri).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+
+    let names = |l: &std::sync::Arc<Listing>| -> Vec<String> { l.window(1, 1, 0, 50, None).get("rows").unwrap().as_arr().unwrap().iter().map(|r| r.str_field("name").unwrap_or("").to_string()).collect() };
+
+    // Folders first, then case-insensitive natural order; dot-files are out of the way.
+    assert_eq!(names(&l), vec!["Zed", "apple.txt", "Banana.md", "cherry.txt"]);
+
+    // Hidden files come and go, and the count follows.
+    assert_eq!(l.set_hidden(true), 5);
+    assert_eq!(names(&l)[1], ".hidden.txt");
+    assert_eq!(l.set_hidden(true), 5, "asking twice changes nothing");
+    assert_eq!(l.set_hidden(false), 4);
+
+    // Type-ahead searches the whole view, case-insensitively, and wraps.
+    let pos = l.seek("ban", None).expect("Banana.md");
+    assert_eq!(names(&l)[pos as usize], "Banana.md");
+    assert_eq!(l.seek("z", None), Some(0));
+    assert_eq!(l.seek("z", Some(0)), Some(0), "one match: searching on wraps back to it");
+    assert_eq!(l.seek("nothing", None), None);
+    assert_eq!(l.seek("", None), None);
+
+    // Filtering narrows the view; sorting then applies to what is left.
+    assert_eq!(l.filter("txt"), 2);
+    assert_eq!(names(&l), vec!["apple.txt", "cherry.txt"]);
+    let (tx, rx) = mpsc::channel();
+    l.sort(SortRole::Size, false, Some((tx, 5)));
+    let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(names(&l), vec!["apple.txt", "cherry.txt"], "300 bytes before 100");
+    let (tx, rx) = mpsc::channel();
+    l.sort(SortRole::Size, true, Some((tx, 6)));
+    let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(names(&l), vec!["cherry.txt", "apple.txt"]);
+
+    // Clearing the filter brings everything back, under the sort that is now in force.
+    assert_eq!(l.filter(""), 4);
+    assert_eq!(names(&l)[0], "Zed", "folders stay first whatever the sort");
+
+    // Sorting by kind groups the two text files together.
+    let (tx, rx) = mpsc::channel();
+    l.sort(SortRole::Kind, true, Some((tx, 7)));
+    let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let k = names(&l);
+    assert_eq!(k[0], "Zed");
+    assert!(k.contains(&"apple.txt".to_string()) && k.len() == 4);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_view_sorts_by_access_time() {
+    let dir = std::env::temp_dir().join(format!("path-atime-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("Zed")).unwrap();
+    // (name, accessed, modified) — in seconds since the epoch, a few years apart so no
+    // filesystem's granularity can blur them.
+    let files = [("oldest-read.txt", 1_100_000_000i64, 1_400_000_000i64), ("middle.txt", 1_200_000_000, 1_300_000_000), ("newest-read.txt", 1_300_000_000, 1_200_000_000)];
+    for (name, atime, mtime) in files {
+        std::fs::write(dir.join(name), b"x").unwrap();
+        set_times(&dir.join(name), atime, mtime);
+    }
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+
+    let names = |l: &Arc<Listing>| -> Vec<String> { l.window(1, 1, 0, 50, None).get("rows").unwrap().as_arr().unwrap().iter().map(|r| r.str_field("name").unwrap_or("").to_string()).collect() };
+    let sorted = |l: &Arc<Listing>, role: SortRole, asc: bool| {
+        let (tx, rx) = mpsc::channel();
+        l.sort(role, asc, Some((tx, 1)));
+        rx.recv_timeout(Duration::from_secs(5)).expect("the sort is answered once every row has metadata");
+        names(l)
+    };
+
+    assert_eq!(sorted(&l, SortRole::Atime, true), vec!["Zed", "oldest-read.txt", "middle.txt", "newest-read.txt"]);
+    assert_eq!(sorted(&l, SortRole::Atime, false), vec!["Zed", "newest-read.txt", "middle.txt", "oldest-read.txt"], "folders stay first when it is reversed");
+    // The other way round entirely, which is what says it is reading the access time and not the
+    // modification time that is right beside it.
+    assert_eq!(sorted(&l, SortRole::Mtime, true), vec!["Zed", "newest-read.txt", "middle.txt", "oldest-read.txt"]);
+
+    // And the time itself reaches the client, in milliseconds, for the column to draw with.
+    let rows = l.window(1, 1, 0, 50, None);
+    let rows = rows.get("rows").unwrap().as_arr().unwrap();
+    for (name, atime, mtime) in files {
+        let m = rows.iter().find(|r| r.str_field("name") == Some(name)).unwrap().get("meta").unwrap();
+        assert_eq!(m.u64_field("atime"), Some(atime as u64 * 1000), "{name}");
+        assert_eq!(m.u64_field("mtime"), Some(mtime as u64 * 1000), "{name}");
+    }
+    assert_eq!(SortRole::parse("atime"), Some(SortRole::Atime), "and the client can ask for it by name");
+    assert_eq!(SortRole::parse("accessed"), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Sets a file's access and modification times, which is the only way to have an atime a test can
+/// say anything about: a `relatime` mount updates it at most once a day by itself.
+fn set_times(path: &std::path::Path, atime: i64, mtime: i64) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [libc::timespec { tv_sec: atime, tv_nsec: 0 }, libc::timespec { tv_sec: mtime, tv_nsec: 0 }];
+    assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) }, 0, "utimensat {}: {}", path.display(), std::io::Error::last_os_error());
+}
+
+/// A window is answered from whatever the listing has; asking past the end is not an error,
+/// and a count above the cap is trimmed rather than refused.
+#[test]
+fn windows_are_clamped_not_refused() {
+    let dir = temp_tree(12);
+    let uri = Uri::from_path(&dir);
+    let (l, _) = open(&uri).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+
+    let w = l.window(1, 1, 0, WINDOW_MAX + 100, None);
+    assert_eq!(w.get("rows").unwrap().as_arr().unwrap().len(), 13, "the folder is shorter than the cap");
+    let w = l.window(1, 1, 11, 10, None);
+    assert_eq!(w.u64_field("first"), Some(11));
+    assert_eq!(w.get("rows").unwrap().as_arr().unwrap().len(), 2);
+    let w = l.window(1, 1, 500, 10, None);
+    assert!(w.get("rows").unwrap().as_arr().unwrap().is_empty(), "past the end is empty, not an error");
+    assert_eq!(w.u64_field("n"), Some(13));
+    assert_eq!(l.count().0, 13);
+    assert!(l.error().is_none());
+
+    // A subscriber that leaves stops being sent to.
+    let (tx, rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 9, lid: 3, tx, first: 0, count: 5, view_first: 0, view_count: 5 });
+    l.unsubscribe(9, 3);
+    l.filter("file1");
+    assert!(drain(&rx).is_empty(), "no events after unsubscribing");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Opening something that is not a directory reports it rather than hanging.
+#[test]
+fn opening_what_is_not_a_folder_is_an_error() {
+    let dir = temp_tree(1);
+    let f = dir.join("file0.txt");
+    let e = open(&Uri::from_path(&f));
+    assert!(e.is_err(), "a file is not a listing");
+    assert!(open(&Uri::from_path(&dir.join("no-such-folder"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `mark_stale` and `gone` are what the watcher calls when a folder changes underneath a
+/// listing; both have to survive being called for a path nothing has open.
+#[test]
+fn cache_invalidation_is_safe_for_paths_nobody_has_open() {
+    let dir = temp_tree(3);
+    let uri = Uri::from_path(&dir);
+    let (l, _) = open(&uri).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    assert!(find(&dir).is_some());
+
+    mark_stale(&dir);
+    assert!(l.inner.lock().unwrap().stale, "the listing knows it is out of date");
+    gone(&dir);
+    assert!(find(&dir).is_none(), "and then it is dropped from the cache");
+
+    let unknown = dir.join("never-opened");
+    mark_stale(&unknown);
+    gone(&unknown);
+    forget(&Uri::from_path(&unknown));
+    assert!(find(&unknown).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A row that leaves every window before its stat job runs is skipped by that job — and used to
+/// stay marked as queued for ever. `enrich_all` passes over queued rows, so the listing could
+/// never finish enriching, and a sort by size or date (which waits for that) never replied:
+/// scroll fast through a big folder, sort it, and the sort hung.
+#[test]
+fn a_row_skipped_by_its_stat_job_can_still_be_enriched() {
+    let dir = temp_tree(SMALL_DIR + 100); // too big to be enriched whole after the scan
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(10)));
+    // What a window request does for the rows it shows…
+    let rows: Vec<u32> = {
+        let mut inner = l.inner.lock().unwrap();
+        let rows: Vec<u32> = (0..inner.meta.len() as u32).filter(|&i| inner.meta[i as usize].is_none()).take(40).collect();
+        assert_eq!(rows.len(), 40, "a folder this size is not enriched up front");
+        for &i in &rows {
+            inner.queued[i as usize] = true;
+        }
+        rows
+    };
+    // …and what a stat worker does once nobody is looking at them any more (no subscriber).
+    l.run_stats(rows.clone(), 0, false);
+    {
+        let inner = l.inner.lock().unwrap();
+        assert!(rows.iter().all(|&i| !inner.queued[i as usize]), "skipped means no longer queued");
+    }
+    let (tx, rx) = mpsc::channel();
+    l.sort(SortRole::Size, false, Some((tx, 9)));
+    assert!(rx.recv_timeout(Duration::from_secs(20)).is_ok(), "the sort is answered once everything is enriched");
+    assert!(l.inner.lock().unwrap().meta.iter().all(Option::is_some));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A rescan deals the pool's indexes again. What is known about a name has to cross it by name:
+/// the thumbnail files were always still on disk, and every picture in view lost its thumbnail
+/// anyway, to be asked for again one by one.
+#[test]
+fn a_rescan_keeps_the_thumbnails_it_had() {
+    let dir = temp_tree(40);
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    // A thumbnail is kept only for the mtime it was made at, and the mtime comes with the meta,
+    // which arrives after the scan: waited for, or this read 0 half the time and the thumbnail
+    // planted below was "for another version of the file" by the time the rescan looked.
+    let mtime = |l: &Arc<Listing>, name: &[u8]| {
+        let start = std::time::Instant::now();
+        loop {
+            {
+                let inner = l.inner.lock().unwrap();
+                let i = inner.pool.find(name).unwrap();
+                if let Some(m) = inner.meta[i as usize].as_ref() {
+                    return m.mtime_ms;
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "meta never arrived for {}", String::from_utf8_lossy(name));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let (m3, m4) = (mtime(&l, b"file3.txt"), mtime(&l, b"file4.txt"));
+    {
+        let mut inner = l.inner.lock().unwrap();
+        inner.deco.set_thumb(b"file3.txt", deco::Thumb::At { path: "/cache/three.png".into(), mtime_ms: m3 });
+        inner.deco.set_thumb(b"file4.txt", deco::Thumb::None { mtime_ms: m4 }); // one that failed
+    }
+    // New names that sort before the old ones, and one gone: every index moves.
+    std::fs::write(dir.join("aaa.txt"), b"1").unwrap();
+    std::fs::remove_file(dir.join("file0.txt")).unwrap();
+    l.rescan();
+    let w = l.window(1, 1, 0, 100, None);
+    let rows = w.get("rows").unwrap().as_arr().unwrap();
+    let thumb = |name: &str| rows.iter().find(|r| r.str_field("name") == Some(name)).unwrap().get("thumb").unwrap().clone();
+    assert_eq!(thumb("file3.txt"), Value::Str("/cache/three.png".into()), "carried by name");
+    assert_eq!(thumb("file4.txt"), Value::Null, "one that could not be made shows nothing");
+    assert_eq!(thumb("file5.txt"), Value::Null, "and nobody else was given one");
+    assert_eq!(thumb("aaa.txt"), Value::Null);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A thumbnail asked for before a rescan and finished after it belongs to the name it was asked
+/// for, wherever that name now is — not to whatever file has taken its old index.
+#[test]
+fn a_thumbnail_that_lands_after_a_rescan_lands_on_its_own_file() {
+    let dir = temp_tree(41);
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let old_idx = l.inner.lock().unwrap().pool.find(b"file7.txt").unwrap();
+    for i in 0..5 {
+        std::fs::remove_file(dir.join(format!("file{i}.txt"))).unwrap();
+    }
+    l.rescan();
+    // Somebody has to be looking at the row, or the job is dropped before it is ever started.
+    let (tx, _rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 1, lid: 1, tx, first: 0, count: 100, view_first: 0, view_count: 100 });
+    // Not a picture, so the job fails and records "none" — which is all this needs: where it lands.
+    l.inner.lock().unwrap().deco.set_thumb(b"file7.txt", deco::Thumb::Asked);
+    l.submit_thumb(old_idx, crate::kinds::Kind::Image, 1, "file7.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let inner = l.inner.lock().unwrap();
+        // Not a picture, so the answer is "there is none" — recorded against file7.txt and
+        // against nothing else, however the rescan moved the indexes.
+        if matches!(inner.deco.get(b"file7.txt").and_then(|d| d.thumb.as_ref()), Some(deco::Thumb::None { .. })) {
+            assert_eq!(inner.deco.known(), 1, "one name knows anything at all");
+            break;
+        }
+        drop(inner);
+        assert!(Instant::now() < deadline, "the thumbnail job never answered");
+        thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// One file arriving or leaving is told as what happened (`Splice`), not as "forget everything
+/// and ask again" (`Reset`); and every answer says which state of the view it describes.
+#[test]
+fn a_small_change_is_spliced_not_reset() {
+    let dir = temp_tree(6);
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let (tx, rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 3, lid: 9, tx, first: 0, count: 50, view_first: 0, view_count: 50 });
+    let before = l.window(3, 9, 0, 50, None).u64_field("gen").unwrap();
+    let _ = drain(&rx);
+
+    std::fs::write(dir.join("file1b.txt"), b"1").unwrap();
+    std::fs::remove_file(dir.join("file0.txt")).unwrap();
+    l.patch(&[b"file1b.txt".to_vec()], &[b"file0.txt".to_vec()], &[]);
+    let events = drain(&rx);
+    assert!(!events.iter().any(|e| e.str_field("event") == Some("Reset")), "{events:?}");
+    let s = events.iter().find(|e| e.str_field("event") == Some("Splice")).expect("a Splice");
+    assert_eq!(s.u64_field("lid"), Some(9));
+    assert_eq!(s.u64_field("n"), Some(7)); // sub + six files, one gone, one new
+    assert_eq!(s.u64_field("gen"), Some(before + 1));
+    let ops = s.get("ops").unwrap().as_arr().unwrap();
+    // [sub, file0, file1, …]: file0 leaves position 1; file1b then lands after file1, at 2.
+    assert_eq!((ops[0].str_field("op"), ops[0].u64_field("pos")), (Some("remove"), Some(1)));
+    assert_eq!((ops[1].str_field("op"), ops[1].u64_field("pos")), (Some("insert"), Some(2)));
+    assert_eq!(ops[1].get("row").unwrap().str_field("name"), Some("file1b.txt"));
+    let w = l.window(3, 9, 0, 50, None);
+    assert_eq!(w.u64_field("gen"), Some(before + 1));
+    let names: Vec<&str> = w.get("rows").unwrap().as_arr().unwrap().iter().map(|r| r.str_field("name").unwrap()).collect();
+    assert_eq!(&names[..4], ["sub", "file1.txt", "file1b.txt", "file2.txt"]);
+
+    // A dot-file arriving where they are hidden changes nothing anyone can see.
+    std::fs::write(dir.join(".hidden"), b"1").unwrap();
+    l.patch(&[b".hidden".to_vec()], &[], &[]);
+    let events = drain(&rx);
+    assert!(!events.iter().any(|e| matches!(e.str_field("event"), Some("Reset" | "Splice"))), "{events:?}");
+    assert_eq!(l.window(3, 9, 0, 50, None).u64_field("n"), Some(7));
+
+    // A filtered view cannot be spliced (the daemon rebuilds it): that is still a Reset.
+    l.filter("file");
+    let _ = drain(&rx);
+    std::fs::write(dir.join("file9.txt"), b"1").unwrap();
+    l.patch(&[b"file9.txt".to_vec()], &[], &[]);
+    let events = drain(&rx);
+    assert!(events.iter().any(|e| e.str_field("event") == Some("Reset") && e.u64_field("gen").is_some()), "{events:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Scrolling a long folder asks about every row it goes past. By the time a worker reaches one,
+/// the window has usually moved on — and a thumbnail nobody can see is worth nothing, so the job
+/// is dropped before it is started. Dropped, not answered: the row must ask again if it is looked
+/// at again, which "there is no thumbnail for this file" would have stopped for good.
+#[test]
+fn a_thumbnail_nobody_is_looking_at_any_more_is_dropped_unstarted() {
+    let dir = temp_tree(42);
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let idx = l.inner.lock().unwrap().pool.find(b"file7.txt").unwrap();
+
+    // A window that does not reach this row — the scroll has gone past it.
+    let (tx, _rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 1, lid: 1, tx, first: 0, count: 2, view_first: 0, view_count: 2 });
+    l.inner.lock().unwrap().deco.set_thumb(b"file7.txt", deco::Thumb::Asked);
+    l.submit_thumb(idx, crate::kinds::Kind::Image, 1, "file7.txt");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let inner = l.inner.lock().unwrap();
+            let thumb = inner.deco.get(b"file7.txt").and_then(|d| d.thumb.as_ref());
+            if thumb.is_none() {
+                break; // unasked: nothing is known, so it can be asked again
+            }
+            assert!(matches!(thumb, Some(deco::Thumb::Asked)), "a dropped job must not record an answer");
+        }
+        assert!(Instant::now() < deadline, "the job was neither dropped nor answered");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // And asking again is exactly what the row now does.
+    let mtime = {
+        let inner = l.inner.lock().unwrap();
+        inner.meta[idx as usize].as_ref().map(|m| m.mtime_ms).unwrap_or(0)
+    };
+    assert!(l.inner.lock().unwrap().deco.wants_thumb(b"file7.txt", mtime));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `git`, for building the fixtures below. A repository made here must not answer to the
+/// developer's own `~/.gitconfig`: a `init.defaultBranch` or a `commit.gpgsign` there would
+/// change what the test sees.
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+/// A small repository with one commit in it.
+fn make_repo(at: &std::path::Path, branch: &str) {
+    std::fs::create_dir_all(at).unwrap();
+    git_in(at, &["init", "-q", "-b", branch]);
+    std::fs::write(at.join("a.txt"), b"a").unwrap();
+    git_in(at, &["add", "-A"]);
+    git_in(at, &["commit", "-qm", "one"]);
+}
+
+fn row_named<'a>(rows: &'a [Value], name: &str) -> &'a Value {
+    rows.iter().find(|r| r.str_field("name") == Some(name)).unwrap_or_else(|| panic!("no row {name}"))
+}
+
+/// Waits until every row of the window satisfies `ok`, or gives up.
+fn rows_until(l: &Arc<Listing>, ok: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let w = l.window(1, 1, 0, 64, None);
+        let rows = w.get("rows").unwrap().as_arr().unwrap().to_vec();
+        if ok(&rows) {
+            return rows;
+        }
+        assert!(Instant::now() < deadline, "rows never settled: {}", crate::json::to_string(&Value::Arr(rows)));
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `~/Projects` is not a repository, so the folder's own status says nothing about anything in
+/// it. Each project in it is a repository of its own, and its row has to say so: the branch
+/// first, and then how that repository stands.
+#[test]
+fn a_folder_of_projects_gives_every_project_its_branch_and_its_state() {
+    if !crate::openin::on_path("git") {
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("path-capsule-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("plain")).unwrap();
+    make_repo(&base.join("clean-one"), "main");
+    make_repo(&base.join("dirty-one"), "release/2");
+    std::fs::write(base.join("dirty-one/a.txt"), b"changed").unwrap();
+    std::fs::write(base.join("loose.txt"), b"x").unwrap();
+
+    let (l, _) = open(&Uri::from_path(&base)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let rows = rows_until(&l, |rows| rows.iter().filter(|r| r.get("git").and_then(|g| g.get("root")).is_some()).count() == 2 && row_named(rows, "dirty-one").get("git").unwrap().str_field("state") == Some("modified"));
+
+    let g = row_named(&rows, "clean-one").get("git").unwrap();
+    assert_eq!(g.get("root").and_then(Value::as_bool), Some(true));
+    assert_eq!(g.str_field("branch"), Some("main"));
+    assert_eq!(g.get("detached").and_then(Value::as_bool), Some(false));
+    assert_eq!(g.str_field("state"), Some("clean"), "nothing against it");
+
+    let g = row_named(&rows, "dirty-one").get("git").unwrap();
+    assert_eq!(g.str_field("branch"), Some("release/2"), "a branch with a slash keeps it");
+    assert_eq!(g.str_field("state"), Some("modified"));
+
+    // Everything that is not a repository is left exactly as it was.
+    assert!(matches!(row_named(&rows, "plain").get("git"), Some(Value::Null)), "a folder that is not a repository says nothing");
+    assert!(matches!(row_named(&rows, "loose.txt").get("git"), Some(Value::Null)));
+
+    // A detached HEAD shows the short hash instead, and says it is detached.
+    let hash = std::process::Command::new("git").arg("-C").arg(base.join("clean-one")).args(["rev-parse", "HEAD"]).output().unwrap();
+    let hash = String::from_utf8_lossy(&hash.stdout).trim().to_string();
+    git_in(&base.join("clean-one"), &["checkout", "-q", &hash]);
+    l.repo_rows(None);
+    let rows = rows_until(&l, |rows| row_named(rows, "clean-one").get("git").unwrap().get("detached").and_then(Value::as_bool) == Some(true));
+    assert_eq!(row_named(&rows, "clean-one").get("git").unwrap().str_field("branch"), Some(&hash[..8]));
+
+    forget(&Uri::from_path(&base));
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// The one real cost of the capsule is a `git` per project, and it must never be on the way to
+/// the rows. The same folder is listed twice — once with the projects in it, once with their
+/// `.git` moved aside so there is nothing to work out — and the two must take the same time.
+#[test]
+fn a_folder_of_projects_lists_no_slower_than_a_folder_of_folders() {
+    if !crate::openin::on_path("git") {
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("path-capsule-cost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let n = 12;
+    for i in 0..n {
+        make_repo(&base.join(format!("p{i}")), "main");
+    }
+    let uri = Uri::from_path(&base);
+
+    let with = {
+        forget(&uri);
+        crate::git::invalidate(&base);
+        let start = Instant::now();
+        let (l, _) = open(&uri).unwrap();
+        assert!(wait_scan(&l, Duration::from_secs(10)));
+        let t = start.elapsed();
+        // The rows are there at once, whether or not a single `git` has run yet.
+        assert_eq!(l.window(1, 1, 0, 64, None).u64_field("n"), Some(n as u64));
+        t
+    };
+    // Every capsule does land, a moment later.
+    let (l, _) = open(&uri).unwrap();
+    rows_until(&l, |rows| rows.iter().all(|r| r.get("git").and_then(|g| g.get("root")).is_some()));
+
+    for i in 0..n {
+        std::fs::rename(base.join(format!("p{i}/.git")), base.join(format!("p{i}/notgit"))).unwrap();
+    }
+    let without = {
+        forget(&uri);
+        crate::git::invalidate(&base);
+        let start = Instant::now();
+        let (l, _) = open(&uri).unwrap();
+        assert!(wait_scan(&l, Duration::from_secs(10)));
+        start.elapsed()
+    };
+    // Twelve gits in a row would be a tenth of a second and more; the listing must not have
+    // waited for one of them.
+    assert!(with < without + Duration::from_millis(60), "listing {n} projects took {with:?} against {without:?} for the same folders without a .git in them: git is on the listing's path");
+    forget(&uri);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A worker picks its rows with the listing locked and pushes them once it has let go. If the
+/// folder shrank in between — a rescan deals the indexes again, into a shorter table — the push
+/// used to index past the end and take the daemon down with the listing's lock held.
+#[test]
+fn pushing_a_row_that_a_rescan_has_taken_away_is_not_a_crash() {
+    let dir = temp_tree(3);
+    let (l, _) = open(&Uri::from_path(&dir)).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    let (tx, rx) = mpsc::channel();
+    l.subscribe(Subscriber { client: 1, lid: 1, tx, first: 0, count: 10, view_first: 0, view_count: 10 });
+    l.push_rows(&[0, 9999, 1]);
+    // The rows that are still there are sent; the one that is not is passed over.
+    let sent: Vec<Value> = drain(&rx).into_iter().filter(|e| e.str_field("event") == Some("Rows")).collect();
+    assert!(!sent.is_empty(), "the rows that do exist are still pushed");
+    forget(&Uri::from_path(&dir));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An edit inside a project moves neither its `HEAD` nor its index, so the stat that stands in
+/// for a watch cannot see it. Showing the folder again is the other moment it is asked about —
+/// without which a project stayed the colour it was when the folder was first opened.
+#[test]
+fn opening_a_folder_of_projects_again_asks_them_again() {
+    if !crate::openin::on_path("git") {
+        return;
+    }
+    let base = std::env::temp_dir().join(format!("path-capsule-reopen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    make_repo(&base.join("one"), "main");
+    let uri = Uri::from_path(&base);
+    let (l, _) = open(&uri).unwrap();
+    assert!(wait_scan(&l, Duration::from_secs(5)));
+    rows_until(&l, |rows| row_named(rows, "one").get("git").unwrap().str_field("state") == Some("clean"));
+
+    // An edit in the working tree, which nothing watches and nothing stats.
+    std::fs::write(base.join("one/new.txt"), b"n").unwrap();
+    thread::sleep(Duration::from_millis(1600)); // past the moment an aggregate is believed for
+    let (l2, cached) = open(&uri).unwrap();
+    assert!(cached, "the same listing, served from memory");
+    rows_until(&l2, |rows| row_named(rows, "one").get("git").unwrap().str_field("state") == Some("untracked"));
+    forget(&uri);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn remote_owner_and_group_names_survive_the_round_trip() {
+    use crate::json::Value;
+    let v = Value::obj().u("size", 5).u("mtime", 1_700_000_000_000u64).u("mode", 0o644).s("owner", "djclark").s("group", "pg1234567").done();
+    let m = crate::vfs::remote::meta_from(&v);
+    let j = rows::meta_json(&m);
+    assert_eq!(j.str_field("owner"), Some("djclark"));
+    assert_eq!(j.str_field("group"), Some("pg1234567"));
+    // The same name again is the same id; a local uid still resolves locally.
+    assert_eq!(m.uid, crate::vfs::remote::meta_from(&v).uid);
+    let bare = crate::vfs::remote::meta_from(&Value::obj().u("size", 1).done());
+    let j = rows::meta_json(&bare);
+    assert!(j.get("owner").is_none_or(|o| matches!(o, Value::Null)), "no name given: no owner ({j:?})");
+    // USER can be unset (RPM/container builds) or name a different account after sudo.
+    // Local ids must resolve through the account database, not the shell environment.
+    let uid = unsafe { libc::getuid() };
+    assert_eq!(names::user(uid), crate::vfs::local::user_name(uid));
+}

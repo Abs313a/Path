@@ -1,0 +1,19 @@
+post_install() {
+  update-desktop-database -q 2>/dev/null || true
+  systemctl --global enable pathfm.socket 2>/dev/null || true
+  echo ":: Path is installed. Start it from the launcher or with 'pathfm'; on first start it offers to"
+  echo "   become the folder handler and the file chooser for your user."
+}
+
+post_upgrade() {
+  update-desktop-database -q 2>/dev/null || true
+}
+
+pre_remove() {
+  systemctl --global disable pathfm.socket 2>/dev/null || true
+}
+
+post_remove() {
+  update-desktop-database -q 2>/dev/null || true
+  echo ":: path removed. Set a new folder handler with: xdg-mime default <app>.desktop inode/directory"
+}

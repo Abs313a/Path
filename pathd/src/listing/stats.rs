@@ -1,0 +1,258 @@
+use super::*;
+
+pub(super) struct StatJob {
+    pub(super) listing: Arc<Listing>,
+    pub(super) rows: Vec<u32>,
+    /// `Inner::epoch` when the rows were chosen: they are pool indexes, and a rescan deals those again.
+    pub(super) epoch: u64,
+    pub(super) low_priority: bool,
+}
+
+pub(super) struct StatPool {
+    pub(super) tx: Sender<StatJob>,
+}
+
+pub(super) fn stat_pool() -> &'static StatPool {
+    static POOL: OnceLock<StatPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<StatJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8);
+        for i in 0..n {
+            let rx = Arc::clone(&rx);
+            thread::Builder::new()
+                .name(format!("stat-{i}"))
+                .spawn(move || loop {
+                    let job = { rx.lock().unwrap().recv() };
+                    match job {
+                        Ok(job) => job.listing.run_stats(job.rows, job.epoch, job.low_priority),
+                        Err(_) => return,
+                    }
+                })
+                .expect("spawn stat worker");
+        }
+        StatPool { tx }
+    })
+}
+
+impl Listing {
+    /// Run on a stat worker: fetch metadata for rows, then push changed rows into live windows.
+    pub(super) fn run_stats(self: &Arc<Self>, rows: Vec<u32>, epoch: u64, low_priority: bool) {
+        let mut done: Vec<u32> = Vec::with_capacity(rows.len());
+        // The folder was read again while this job waited or worked: its indexes are another
+        // listing's now — past the end of a folder that shrank (a panic, with the lock held), or
+        // some other file's. The rescan cleared every `queued` mark, so what still lacks metadata
+        // is simply asked for again.
+        let overtaken = |me: &Arc<Self>| {
+            let enriching = me.inner.lock().unwrap().enrich.is_some();
+            if enriching {
+                me.enrich_all(true);
+            }
+        };
+        for idx in rows {
+            // Skip rows that scrolled out of every live window (unless enriching everything).
+            let name = {
+                let mut inner = self.inner.lock().unwrap();
+                if inner.epoch != epoch {
+                    drop(inner);
+                    return overtaken(self);
+                }
+                if !low_priority {
+                    let p = inner.pos[idx as usize];
+                    if p == u32::MAX || !inner.subscribers.iter().any(|s| s.covers(p)) {
+                        // Skipped, so no longer queued. Left marked, the row could never be
+                        // queued again: `enrich_all` passes over queued rows, enrichment never
+                        // finished, and a sort by size or date waiting on it never got its reply
+                        // — scroll a folder fast, sort it, and the sort hung.
+                        inner.queued[idx as usize] = false;
+                        continue;
+                    }
+                }
+                inner.pool.name(idx).to_vec()
+            };
+            let res = self.dir.stat_child(OsStr::from_bytes(&name));
+            let mut inner = self.inner.lock().unwrap();
+            if inner.epoch != epoch {
+                drop(inner);
+                return overtaken(self);
+            }
+            inner.queued[idx as usize] = false;
+            match res {
+                Ok((m, t)) => {
+                    if inner.pool.entry_type(idx) == EntryType::Unknown {
+                        inner.pool.set_entry_type(idx, t);
+                    }
+                    inner.meta[idx as usize] = Some(m);
+                }
+                Err(_) => {
+                    inner.meta[idx as usize] = Some(Meta::default());
+                }
+            }
+            done.push(idx);
+            if let Some(e) = inner.enrich.as_mut() {
+                if low_priority {
+                    e.done += 1;
+                }
+            }
+            // Thumbnails only for rows inside a live window, at low priority.
+            let kind = inner.pool.kind(idx);
+            let p = inner.pos[idx as usize];
+            let visible = p != u32::MAX && inner.subscribers.iter().any(|s| s.covers_view(p));
+            let mtime = inner.meta[idx as usize].as_ref().map(|m| m.mtime_ms).unwrap_or(0);
+            if visible && self.thumbable(kind) && inner.deco.wants_thumb(&name, mtime) {
+                inner.deco.set_thumb(&name, super::deco::Thumb::Asked);
+                let name = String::from_utf8_lossy(&name).into_owned();
+                drop(inner);
+                self.submit_thumb(idx, kind, mtime, &name);
+                continue;
+            }
+        }
+        self.push_rows(&done);
+        if low_priority {
+            self.enrich_progress();
+        }
+    }
+
+    pub(super) fn thumbable(&self, kind: crate::kinds::Kind) -> bool {
+        self.uri.is_local() && crate::thumbs::thumbable(kind)
+    }
+
+    /// Ask for one row's thumbnail. The caller has already marked it `Asked`.
+    pub(super) fn submit_thumb(self: &Arc<Self>, idx: u32, kind: crate::kinds::Kind, mtime_ms: u64, name: &str) {
+        let uri = self.uri.join(name);
+        let name = name.as_bytes().to_vec();
+        let wants = Arc::clone(self);
+        let wanted_name = name.clone();
+        let me = Arc::clone(self);
+        crate::thumber::submit(crate::thumber::Job {
+            uri,
+            kind,
+            mtime_ms,
+            size: crate::thumbs::Size::Normal,
+            // Still worth making by the time a worker gets to it? A scroll through a long folder
+            // asks about every row it passes, and by then most of them are far behind the window.
+            wanted: Some(Box::new(move || {
+                let inner = wants.inner.lock().unwrap();
+                let Some(at) = inner.at(idx, &wanted_name) else { return false };
+                let p = inner.pos[at as usize];
+                p != u32::MAX && inner.subscribers.iter().any(|s| s.covers_view(p))
+            })),
+            done: Box::new(move |answer| {
+                // The answer belongs to the name it was asked about, whatever row that name is on
+                // now: a rescan while the job ran has dealt the indexes again.
+                let mut inner = me.inner.lock().unwrap();
+                match answer {
+                    crate::thumber::Answer::Made(p) => inner.deco.set_thumb(&name, super::deco::Thumb::At { path: p.to_string_lossy().into_owned(), mtime_ms }),
+                    crate::thumber::Answer::None => inner.deco.set_thumb(&name, super::deco::Thumb::None { mtime_ms }),
+                    // Never made, so nothing is known: the row asks again if it is looked at again.
+                    crate::thumber::Answer::Dropped => {
+                        inner.deco.unask_thumb(&name);
+                        return;
+                    }
+                }
+                let Some(at) = inner.at(idx, &name) else { return };
+                drop(inner);
+                me.push_rows(&[at]);
+            }),
+        });
+    }
+
+    /// Stat every row at low priority; replies to `waiter` when complete.
+    pub fn enrich(self: &Arc<Self>, waiter: Option<(Sender<Value>, u64)>) {
+        let complete = {
+            let mut inner = self.inner.lock().unwrap();
+            let complete = inner.meta.iter().all(Option::is_some);
+            if !complete {
+                if let Some(w) = waiter.clone() {
+                    match inner.enrich.as_mut() {
+                        Some(e) => e.waiters.push(w),
+                        None => {
+                            inner.enrich = Some(Enrich { total: 0, done: 0, waiters: vec![w] });
+                        }
+                    }
+                }
+            }
+            complete
+        };
+        if complete {
+            if let Some(w) = waiter {
+                let _ = w.0.send(proto::ok(w.1, Value::obj().done()));
+            }
+            return;
+        }
+        self.enrich_all(true);
+    }
+
+    pub(super) fn enrich_all(self: &Arc<Self>, low_priority: bool) {
+        let (epoch, rows): (u64, Vec<u32>) = {
+            let mut inner = self.inner.lock().unwrap();
+            let wants = |inner: &Inner, i: u32| inner.meta[i as usize].is_none() && !inner.queued[i as usize];
+            let mut rows: Vec<u32> = inner.view.iter().copied().filter(|&i| wants(&inner, i)).collect();
+            rows.extend((0..inner.meta.len() as u32).filter(|&i| inner.pos[i as usize] == u32::MAX && wants(&inner, i)));
+            for &i in &rows {
+                inner.queued[i as usize] = true;
+            }
+            let total = inner.meta.iter().filter(|m| m.is_none()).count() as u32;
+            match inner.enrich.as_mut() {
+                Some(e) => {
+                    e.total = e.done + total;
+                }
+                None => inner.enrich = Some(Enrich { total, done: 0, waiters: Vec::new() }),
+            }
+            (inner.epoch, rows)
+        };
+        if rows.is_empty() {
+            self.enrich_progress();
+            return;
+        }
+        for batch in rows.chunks(256) {
+            let _ = stat_pool().tx.send(StatJob { listing: Arc::clone(self), rows: batch.to_vec(), epoch, low_priority });
+        }
+    }
+
+    pub(super) fn enrich_progress(self: &Arc<Self>) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(e) = inner.enrich.as_ref() else { return };
+        let (done, total) = (e.done, e.total);
+        let complete = inner.meta.iter().all(Option::is_some);
+        let subs = inner.subscribers.clone();
+        if !complete {
+            drop(inner);
+            for s in subs {
+                let _ = s.tx.send(proto::event("Progress").u("lid", s.lid).u("done", done as u64).u("total", total as u64).done());
+            }
+            return;
+        }
+        let e = inner.enrich.take().unwrap();
+        let needs_resort = inner.sort.0.needs_meta() && !inner.sorted;
+        if needs_resort {
+            inner.rebuild_view();
+            inner.generation += 1;
+        }
+        let n = inner.view.len() as u64;
+        let gen = inner.generation;
+        drop(inner);
+        for s in &subs {
+            if needs_resort {
+                let _ = s.tx.send(proto::event("Reset").u("lid", s.lid).u("n", n).u("gen", gen).done());
+            }
+        }
+        for (tx, id) in e.waiters {
+            let _ = tx.send(proto::ok(id, Value::obj().u("n", n).done()));
+        }
+    }
+
+    pub fn stat_uri(uri: &Uri) -> Result<Value> {
+        if !uri.is_local() {
+            let (session, rpath) = crate::locations::resolve(uri)?;
+            let v = session.plugin.request(session.req("Stat").s("path", rpath).done())?;
+            return Ok(meta_json(&crate::vfs::remote::meta_from(&v)));
+        }
+        let path = uri.to_path();
+        let parent = path.parent().ok_or(VfsError::NotFound)?;
+        let name = path.file_name().ok_or(VfsError::NotFound)?;
+        let dir = DirHandle::open(parent)?;
+        let (m, _) = dir.stat_child(name)?;
+        Ok(meta_json(&m))
+    }
+}

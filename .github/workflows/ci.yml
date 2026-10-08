@@ -1,0 +1,87 @@
+name: CI
+
+# Every push and pull request: format, lint, tests, and a package per architecture, kept as
+# artifacts. Nothing here publishes anything — a release is a deliberate act, `release.yml`,
+# run by hand: it takes a CI run's packages, drives one under a compositor, tags the commit they
+# were built from and publishes them. What ships is what CI built and tested, and no commit
+# becomes a release on its own.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', '**/*.md']
+  pull_request:
+    paths-ignore: ['docs/**', '**/*.md']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything cargo, and the package, per architecture: one container, one checkout, one cache.
+  # The package job used to be separate and built the release binaries again from cold; now
+  # makepkg builds into the same cached `target/` the tests use. Cargo runs as `builder`
+  # throughout because makepkg refuses root; root only installs packages.
+  rust:
+    name: Daemon, plugins and package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-latest,    image: "archlinux:latest" }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, image: "menci/archlinuxarm:base-devel" }
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Install toolchain
+        run: |
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf sudo \
+            openssh vsftpd ffmpeg dbus xdg-desktop-portal libpng glib2 gvfs gvfs-smb
+          useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+            target
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+      - run: chown -R builder . /home/builder
+      - name: Format and lint
+        run: sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" make lint
+      - name: Unit and integration tests
+        run: sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" make test-rust
+      - name: Protocol and plugin contract tests
+        run: sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test --test '*' -- --include-ignored
+      - name: makepkg
+        # `--nocheck`: the PKGBUILD's check() is the whole test suite again in release profile,
+        # and it has just run above on this commit. Building by hand still runs it.
+        # `PKGEXT`: Arch Linux ARM's makepkg.conf says `.pkg.tar.xz`; the installer and the
+        # release name the file with `.zst` on both architectures, so this does too.
+        run: |
+          sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" PKGEXT=.pkg.tar.zst bash -c 'cd packaging && makepkg -f --nodeps --noconfirm --nocheck'
+          cd packaging && ls -l && sha256sum path-*.pkg.tar.zst > "$(ls path-*.pkg.tar.zst).sha256" && ls -l path-*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: path-package-${{ matrix.arch }}
+          path: |
+            packaging/path-*.pkg.tar.zst
+            packaging/path-*.pkg.tar.zst.sha256
+
+  qml:
+    name: QML leaf and interaction tests
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install Qt
+        # Beyond Qt itself: the SVG plugin the icons are drawn with, QtMultimedia and its ffmpeg
+        # backend for the info panel's video player, and a font — a bare container has none, and
+        # text with no metrics reports a pixel size of -1 and lays out on top of its neighbours.
+        run: |
+          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed make xorg-server-xvfb \
+            qt6-base qt6-declarative qt6-svg qt6-multimedia qt6-multimedia-ffmpeg ttf-liberation
+      - uses: actions/checkout@v7
+      - name: Run qmltestrunner
+        run: |
+          export QT_QPA_PLATFORM=offscreen
+          make test-qml
