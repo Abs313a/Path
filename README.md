@@ -22,7 +22,7 @@
 
 ```
 ┌──────────────────────────────────────────┐
-│      Quickshell / Qt6 UI (pathfm)       │  <── Client layer (QML / X11)
+│      Quickshell / Qt6 UI (pathfm)        │  <── Client layer (QML / X11)
 └────────────────────┬─────────────────────┘
                      │ UNIX Domain Socket
 ┌────────────────────▼─────────────────────┐
