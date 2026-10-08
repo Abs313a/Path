@@ -5,9 +5,14 @@
 # The running instance is found the way it was started — by the path of its shell.qml. (It used to
 # be looked for with `qs -c pathfm`, a named config this package does not install, so it was never
 # found and every launch was another window.) The folder goes in PATHFM_START, which is what the
-# shell reads; as an argument after `--` it was never looked at, and every launch opened home.
 set -e
-CONF="${PATHFM_SHELL_DIR:-/usr/share/path}/shell.qml"
+if [ -n "${PATHFM_SHELL_DIR:-}" ]; then
+  CONF="${PATHFM_SHELL_DIR}/shell.qml"
+elif [ -f "/usr/local/share/path/shell.qml" ]; then
+  CONF="/usr/local/share/path/shell.qml"
+else
+  CONF="/usr/share/path/shell.qml"
+fi
 # `pathfm --ipc <function> [args…]`: a call into the running window, for tools path started — the
 # Neovim preset tells it a file was saved, or asks it to reveal one. Quiet when path is not up.
 if [ "${1:-}" = "--ipc" ]; then

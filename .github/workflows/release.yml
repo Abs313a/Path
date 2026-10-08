@@ -79,7 +79,7 @@ jobs:
         run: |
           sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed git sudo cage wtype grim dbus \
             xdg-desktop-portal gnome-keyring openssh vsftpd ffmpeg python nodejs npm \
-            qt6-base qt6-declarative qt6-wayland quickshell samba gvfs-smb
+            qt6-base qt6-declarative quickshell samba gvfs-smb
           useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
       - uses: actions/checkout@v7
         with:

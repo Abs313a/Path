@@ -28,6 +28,7 @@ pub fn plugin_dirs() -> Vec<PathBuf> {
         v.push(PathBuf::from(d));
     }
     v.push(crate::config::home().join(".local/lib/path/plugins"));
+    v.push(PathBuf::from("/usr/local/lib/path/plugins"));
     v.push(PathBuf::from("/usr/lib/path/plugins"));
     v
 }
