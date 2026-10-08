@@ -56,6 +56,7 @@ pub fn unview(job: u64) {
     let wanted = crate::jobs::plan_wanted(job);
     let mut p = plans().lock().unwrap();
     let Some(s) = p.get(&job) else { return };
+    #[allow(deprecated)]
     let left = s.viewers.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1))).unwrap_or(1).saturating_sub(1);
     if left == 0 && !wanted {
         p.remove(&job);

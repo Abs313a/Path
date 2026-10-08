@@ -382,6 +382,7 @@ impl tokio::io::AsyncWrite for Counting {
             let counters = self.counters.clone();
             drain_packets(&mut self.wbuf, |t| {
                 if t == FXP_DATA || t == FXP_STATUS {
+                    #[allow(deprecated)]
                     let _ = counters.inflight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)));
                 }
             });

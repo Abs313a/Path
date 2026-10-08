@@ -560,6 +560,7 @@ pub mod liblog {
         if opened {
             JOB_SESSIONS.fetch_add(1, Ordering::Relaxed);
         } else {
+            #[allow(deprecated)]
             let _ = JOB_SESSIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
         }
     }
