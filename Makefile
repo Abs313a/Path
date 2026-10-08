@@ -87,6 +87,7 @@ lint: clippy
 	python3 tests/fedora_packaging_check.py
 	python3 tests/fedora_license_check.py
 	python3 tests/i18n_check.py
+	python3 tests/x11_pure_check.py
 	@# One version in Cargo.toml, the window and the packages: the socket is named for it.
 	python3 tests/version_check.py
 

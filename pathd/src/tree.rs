@@ -3,7 +3,6 @@ use crate::kinds::Kind;
 use crate::listing;
 use crate::vfs::uri::Uri;
 use crate::vfs::VfsError;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -184,82 +183,18 @@ impl Tree {
     }
 }
 
-// ---------------------------------------------------------------- Hyprland arrangement (best effort)
+// ---------------------------------------------------------------- X11 arrangement (window manager managed)
 
-fn hyprctl(args: &[&str]) -> Option<String> {
-    let out = Command::new("hyprctl").args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        None
-    }
-}
-
-/// Finds a window's address from `hyprctl clients -j`: by pid when one is known — that is THE
-/// window — and by class otherwise. Never one in `taken`: two roles must not resolve to the same
-/// window, which is what happened when the editor and the agent shared a class.
-fn find_window(class: &str, pid: Option<u64>, taken: &[String]) -> Option<String> {
-    let text = hyprctl(&["clients", "-j"])?;
-    let v = crate::json::parse(text.as_bytes()).ok()?;
-    pick_window(v.as_arr()?, class, pid, taken)
-}
-
-fn pick_window(clients: &[Value], class: &str, pid: Option<u64>, taken: &[String]) -> Option<String> {
+pub fn pick_window(clients: &[Value], class: &str, pid: Option<u64>, taken: &[String]) -> Option<String> {
     let free = |c: &&Value| c.str_field("address").is_some_and(|a| !taken.iter().any(|t| t == a));
     let by_pid = clients.iter().filter(free).find(|c| pid.is_some_and(|p| p > 0) && c.u64_field("pid") == pid);
     let by_class = || clients.iter().filter(free).find(|c| !class.is_empty() && c.str_field("class") == Some(class));
     by_pid.or_else(by_class).and_then(|c| c.str_field("address").map(str::to_string))
 }
 
-/// `windows`: [{ role, class, pid }] in left-to-right order; the first gets `left_width` px.
-pub fn arrange(windows: &[Value], left_width: u32) -> Value {
-    let mut arranged = Vec::new();
-    let mut missing = Vec::new();
-    if hyprctl(&["version"]).is_none() {
-        return Value::obj()
-            .v("arranged", Value::Arr(vec![]))
-            .v("missing", Value::Arr(windows.iter().map(|w| Value::Str(w.str_field("role").unwrap_or("").into())).collect()))
-            .s("reason", "hyprctl not available")
-            .done();
-    }
-    let mut addrs: Vec<(String, String)> = Vec::new();
-    for w in windows {
-        let role = w.str_field("role").unwrap_or("").to_string();
-        let mut found = None;
-        for _ in 0..25 {
-            let taken: Vec<String> = addrs.iter().map(|(_, a)| a.clone()).collect();
-            found = find_window(w.str_field("class").unwrap_or(""), w.u64_field("pid"), &taken);
-            if found.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        match found {
-            Some(a) => {
-                addrs.push((role.clone(), a));
-                arranged.push(Value::Str(role));
-            }
-            None => missing.push(Value::Str(role)),
-        }
-    }
-    // Focus each in order and push it right of the previous; then fix the first one's width.
-    for (i, (_, a)) in addrs.iter().enumerate() {
-        let _ = hyprctl(&["dispatch", "focuswindow", &format!("address:{a}")]);
-        let _ = hyprctl(&["dispatch", "settiled", &format!("address:{a}")]);
-        if i > 0 {
-            let _ = hyprctl(&["dispatch", "movewindow", "r"]);
-        } else {
-            let _ = hyprctl(&["dispatch", "movewindow", "l"]);
-        }
-    }
-    if let Some((_, a)) = addrs.first() {
-        let _ = hyprctl(&["dispatch", "focuswindow", &format!("address:{a}")]);
-        let _ = hyprctl(&["dispatch", "resizeactive", "exact", &left_width.to_string(), "0"]);
-    }
-    if let Some((_, a)) = addrs.get(1) {
-        let _ = hyprctl(&["dispatch", "focuswindow", &format!("address:{a}")]);
-    }
-    Value::obj().v("arranged", Value::Arr(arranged)).v("missing", Value::Arr(missing)).done()
+/// Under pure X11, window layout is managed natively by dwm / window manager.
+pub fn arrange(_windows: &[Value], _left_width: u32) -> Value {
+    Value::obj().v("arranged", Value::Arr(vec![])).v("missing", Value::Arr(vec![])).done()
 }
 
 #[cfg(test)]

@@ -300,22 +300,8 @@ pub fn open(id_or_role: &str, uris: &[Uri], line: Option<u64>) -> Result<(u32, b
     Ok((pid, false))
 }
 
-/// Best-effort Hyprland placement of the window that just opened.
-fn place(placement: &str) {
-    let dir = match placement {
-        "right" => "r",
-        "left" => "l",
-        _ => return,
-    };
-    if !on_path("hyprctl") {
-        return;
-    }
-    let dir = dir.to_string();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let _ = Command::new("hyprctl").args(["dispatch", "movewindow", &dir]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    });
-}
+/// Window placement under X11 is handled natively by the window manager.
+fn place(_placement: &str) {}
 
 pub fn sessions_json() -> Value {
     let mut s = sessions().lock().unwrap();

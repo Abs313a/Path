@@ -4,10 +4,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 out="$here/out"; mkdir -p "$out"
 
-# The desktop mode (below) hands the daemon and the shell a runtime directory of their own, but
-# hyprctl and the screen recorder must keep looking in the real one; the demo flow uses these.
+# The desktop mode (below) hands the daemon and the shell a runtime directory of their own.
 export PATHFM_E2E_REAL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-desktop_display="$PATHFM_E2E_REAL_RUNTIME_DIR/${WAYLAND_DISPLAY:-wayland-1}"
+desktop_display="${DISPLAY:-:0}"
 mkdir -p "$root/target/e2e"
 work="$(mktemp -d "$root/target/e2e/run-XXXXXX")"
 export XDG_RUNTIME_DIR="$work/run"; mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
@@ -177,14 +176,9 @@ run_daemon_only() {
 run_on_desktop() {
   # The same client script as run_in_cage, on the compositor this shell is already in: for the
   # demo recording (flows/demo.py), which wants the real renderer, the real theme and the real
-  # screen. The private runtime directory keeps this daemon and shell apart from the user's own,
-  # which means the Wayland socket has to be named by its full path.
-  export WAYLAND_DISPLAY="${desktop_display}"
-  unset WLR_BACKENDS WLR_LIBINPUT_NO_DEVICES WLR_RENDERER
-  # A real pointer (wlrctl's virtual one, which Hyprland serves): the window is full screen at
-  # the origin, and Hyprland can say where the cursor is, so aiming corrects itself.
+  export DISPLAY="${desktop_display}"
   export PATHFM_E2E_POINTER_ORIGIN="0,0"
-  export PATHFM_E2E_CURSORPOS_CMD="env XDG_RUNTIME_DIR=$PATHFM_E2E_REAL_RUNTIME_DIR hyprctl cursorpos"
+  export PATHFM_E2E_CURSORPOS_CMD="xdotool getmouselocation"
   # The shell's HOME is the fixture, so the breadcrumb starts at the home icon and the sidebar's
   # home is the demo's; the theme is read from HOME too, so the real one's is linked in.
   mkdir -p "$HOME_FIXTURE/.local/state/omarchy" "$HOME_FIXTURE/.config"

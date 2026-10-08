@@ -457,10 +457,10 @@ FloatingWindow {
     // `RepoChanged` comes once per listing that read the repo — the other pane's, every column's —
     // and each used to reload the same repo state; the pane's own listing's word is enough.
     Connections { target: Path.Daemon; function onEvent(msg) { if (msg.event === "RepoChanged" && (!msg.lid || msg.lid === win.pane.listing.lid)) win.loadRepo(); if (msg.event === "OpenInChanged") win.loadOpenIn(); if (msg.event === "ShowChooser") portal.open(msg); if (msg.event === "ShowItems") win.showItems(msg) } }
-    /// Bring the window to the front of the workspace it is on. Asked for by whatever opened
-    /// something in it from outside — a second `pathfm`, "Show in folder" from a browser — which
-    /// is otherwise answered by a window nobody can see.
-    function raise() { Quickshell.execDetached(["hyprctl", "dispatch", "focuswindow", "pid:" + Quickshell.processId]) }
+    /// Copy plain text to the X11 clipboard via xclip.
+    function copyToClipboard(text) { Quickshell.execDetached(["sh", "-c", "printf '%s' \"$1\" | xclip -selection clipboard", "_", text]) }
+    /// Bring the window to the front of the X11 desktop via xdotool.
+    function raise() { Quickshell.execDetached(["xdotool", "search", "--pid", "" + Quickshell.processId, "windowactivate"]) }
     /// Open a folder, or a file's folder with the file selected, and come to the front: what a
     /// second launch of path does to the one already running.
     function present(uri) {
@@ -536,7 +536,7 @@ FloatingWindow {
         // looking. Columns answers for the column that folder is in; everywhere else nobody does,
         // and Ops falls back to the pane's own listing and list view's editor.
         onListingNeeded: (spec, reply) => { const c = win.columnsPane(); reply(c ? c.listingFor(spec.dest) : null) }
-        onCopyText: text => Quickshell.execDetached(["wl-copy", text])
+        onCopyText: text => win.copyToClipboard(text)
     }
     property alias clipboard: ops.clipboard
     function copySelection(cut) { ops.copySelection(cut, win.selectedUris()) }
@@ -712,7 +712,7 @@ FloatingWindow {
             const info = r && win.trashInfo[r.name]
             return [
                 { label: info ? Path.T.tr("menu.restoreTo", { path: Path.Format.display(info.path.replace(/\/[^/]*$/, "") || "/", win.home) }) : Path.T.tr("menu.restore"), key: "Enter", enabled: sel, action: () => win.restoreSelection() },
-                { id: "copyPath", label: Path.T.tr("menu.copyPath"), enabled: sel && !!info, action: () => Quickshell.execDetached(["wl-copy", info.path]) },
+                { id: "copyPath", label: Path.T.tr("menu.copyPath"), enabled: sel && !!info, action: () => win.copyToClipboard(info.path) },
                 { id: "emptyTrash", label: Path.T.tr("menu.emptyTrash"), danger: true, sep: true, enabled: pane.listing.count > 0, action: () => win.emptyTrash() },
             ]
         }
@@ -1646,7 +1646,7 @@ FloatingWindow {
         onLogRequested: job => { activity.close(); jobLog.openJob(job) }
         onRevealRequested: uri => win.revealUri(uri)
     }
-    UI.JobLogWindow { id: jobLog; objectName: "joblog"; onCopyText: text => Quickshell.execDetached(["wl-copy", text]) }
+    UI.JobLogWindow { id: jobLog; objectName: "joblog"; onCopyText: text => win.copyToClipboard(text) }
     // A second top-level window, declared here so it is this window's: Quickshell maps it when
     // `visible` goes true and unmaps it when it goes false, and maps it again on the next
     // (measured under 0.3.1 — a nested FloatingWindow, unlike the root, does come back).

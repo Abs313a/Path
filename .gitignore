@@ -5,3 +5,4 @@ target/
 docs/design/path-file-manager.html
 tests/e2e/out/
 __pycache__/
+.worktrees/

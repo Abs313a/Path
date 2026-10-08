@@ -123,7 +123,7 @@ Rectangle {
         Row { id: chip; anchors.centerIn: parent; spacing: 5
             Icon { name: "mirror"; size: 10; color: bc.repo && bc.repo.dirty ? Path.Theme.yellow : Path.Theme.muted; anchors.verticalCenter: parent.verticalCenter }
             Text { text: bc.repo ? (bc.repo.detached ? bc.repo.branch : bc.repo.branch) + (bc.repo.ahead ? " ↑" + bc.repo.ahead : "") + (bc.repo.behind ? " ↓" + bc.repo.behind : "") : ""; color: Path.Theme.fgDim; font.family: Path.Theme.mono; font.pixelSize: 11 } }
-        MouseArea { anchors.fill: parent; onClicked: Quickshell.execDetached(["wl-copy", bc.repo.branch]) }
+        MouseArea { anchors.fill: parent; onClicked: Quickshell.execDetached(["sh", "-c", "printf '%s' \"$1\" | xclip -selection clipboard", "_", bc.repo.branch]) }
     }
     TextInput {
         id: input
