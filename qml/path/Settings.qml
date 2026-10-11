@@ -27,7 +27,7 @@ QtObject {
     property var editor: ({ terminal: "auto", placement: "right" })
     property var git: ({ enabled: true, showIgnored: "dim", folders: "aggregate" })
     property var project: ({ width: 320, arrange: true, agent: true })
-    property var jarvis: ({ provider: "omarchy", cliCommand: "" })
+    property var jarvis: ({ provider: "anthropic", cliCommand: "" })
     property var index: ({ roots: [], excludes: [] })
     property var integration: ({ asked: false })
     /// Rebound shortcuts: action id -> chord. Empty means everything is on its default.

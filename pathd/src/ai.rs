@@ -8,43 +8,12 @@ fn jarvis_settings() -> Value {
     crate::config::settings().get("jarvis").cloned().unwrap_or(Value::Null)
 }
 
-/// Omarchy's chosen AI: the web app its AI keybinding launches. Heuristic; the override wins.
-pub fn omarchy_provider() -> Option<&'static str> {
-    let home = crate::config::home();
-    for p in [home.join(".config/hypr/bindings.conf"), home.join(".local/share/omarchy/default/hypr/bindings.conf")] {
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
-        for line in text.lines() {
-            let l = line.to_ascii_lowercase();
-            let is_ai = l.contains("super, a,") || l.contains("super, a ,") || l.contains(", ai,") || l.contains("chatgpt") || l.contains("claude") || l.contains("grok") || l.contains("gemini");
-            if !is_ai || !l.contains("webapp") && !l.contains("http") {
-                continue;
-            }
-            if l.contains("claude.ai") || l.contains("anthropic") {
-                return Some("anthropic");
-            }
-            if l.contains("chatgpt.com") || l.contains("openai") {
-                return Some("openai");
-            }
-            if l.contains("gemini.google") {
-                return Some("gemini");
-            }
-            if l.contains("grok.com") || l.contains("x.ai") {
-                return Some("xai");
-            }
-        }
-    }
-    None
-}
-
 /// The effective provider and where the choice came from.
 pub fn provider() -> (String, &'static str) {
     let s = jarvis_settings();
     match s.str_field("provider") {
-        Some(p) if p != "omarchy" && PROVIDERS.contains(&p) => (p.to_string(), "settings"),
-        _ => match omarchy_provider() {
-            Some(p) => (p.to_string(), "omarchy"),
-            None => ("anthropic".into(), "default"),
-        },
+        Some(p) if PROVIDERS.contains(&p) => (p.to_string(), "settings"),
+        _ => ("anthropic".into(), "default"),
     }
 }
 
@@ -89,11 +58,9 @@ pub fn opening_prompt(paths: &[String]) -> String {
     format!("I have questions about {files}. Read {} and wait for my first question.", if paths.len() == 1 { "it" } else { "them" })
 }
 
-/// The terminal a program is run in: the desktop's chosen one (`xdg-terminal-exec`, which is
-/// how Omarchy opens its own), else `$TERMINAL -e`, else alacritty.
-/// It is started in `dir` either way; `xdg-terminal-exec` is told as well, as Omarchy's own
-/// launcher tells it — a terminal that is one server with many windows takes its folder from
-/// the option, not from whoever started the client.
+/// The terminal a program is run in: the desktop's chosen one (`xdg-terminal-exec`),
+/// else `$TERMINAL -e`, else alacritty.
+/// It is started in `dir` either way.
 pub fn terminal_argv(program: Vec<String>, dir: &std::path::Path, have_xdg: bool, terminal_env: Option<String>) -> Vec<String> {
     let mut argv = if have_xdg { vec!["xdg-terminal-exec".to_string(), format!("--dir={}", dir.display())] } else { vec![terminal_env.filter(|t| !t.is_empty()).unwrap_or_else(|| "alacritty".into()), "-e".to_string()] };
     argv.extend(program);
@@ -143,14 +110,13 @@ pub fn status() -> Value {
         .b("configured", available)
         .s("provider", p.clone())
         .s("chosenBy", chosen_by)
-        .opt_s("omarchyProvider", omarchy_provider())
         .opt_s("cli", cli.as_deref())
         .b("cliAvailable", available)
         .v("providers", Value::Arr(PROVIDERS.iter().map(|x| Value::Str(x.to_string())).collect()))
         .done()
 }
 
-/// Settings → AI: provider ("omarchy" to follow Omarchy) and an optional custom command.
+/// Settings → AI: provider and an optional custom command.
 pub fn configure(provider_choice: Option<&str>, cli_command: Option<&str>) -> Result<(), VfsError> {
     let mut patch = Value::obj();
     if let Some(p) = provider_choice {

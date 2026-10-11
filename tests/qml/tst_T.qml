@@ -12,34 +12,27 @@ TestCase {
 
     function test_the_language_is_the_first_of_the_os_that_has_a_catalog() {
         compare(Path.T.pick(["en-Latn-US", "en-US", "en-Latn", "en"]), "en")
-        compare(Path.T.pick(["es-Latn-MX", "es-MX", "es-Latn", "es"]), "es", "a regional Spanish lands on es")
-        compare(Path.T.pick(["ja-Jpan-JP", "ja-JP", "ja-Jpan", "ja"]), "ja")
+        compare(Path.T.pick(["es-Latn-MX", "es-MX", "es-Latn", "es"]), "en", "a language without a catalog: English")
+        compare(Path.T.pick(["ja-Jpan-JP", "ja-JP", "ja-Jpan", "ja"]), "en", "a language without a catalog: English")
         compare(Path.T.pick(["fr-Latn-FR", "fr-FR", "fr"]), "en", "a language without a catalog: English")
         compare(Path.T.pick(["C"]), "en")
         compare(Path.T.pick([]), "en")
-        compare(Path.T.pick(["fr", "ja", "en"]), "ja", "the first that has one, in the OS's order")
+        compare(Path.T.pick(["fr", "ja", "en"]), "en", "falls back to en when no other catalog exists")
     }
     function test_a_sentence_with_its_placeholders_in_each_language() {
         compare(Path.T.tr("date.yesterdayAt", { time: "14:02" }), "yesterday 14:02")
         Path.T.language = "es"
-        compare(Path.T.tr("date.yesterdayAt", { time: "14:02" }), "ayer 14:02")
+        compare(Path.T.tr("date.yesterdayAt", { time: "14:02" }), "yesterday 14:02", "falls back to English")
         Path.T.language = "ja"
-        compare(Path.T.tr("date.yesterdayAt", { time: "14:02" }), "昨日 14:02")
+        compare(Path.T.tr("date.yesterdayAt", { time: "14:02" }), "yesterday 14:02", "falls back to English")
     }
     function test_plurals_by_form_and_japanese_with_one() {
         compare(Path.T.tr("count.items", { n: 1 }), "1 item")
         compare(Path.T.tr("count.items", { n: 2 }), "2 items")
         compare(Path.T.tr("count.items", { n: 0 }), "0 items")
-        Path.T.language = "es"
-        compare(Path.T.tr("count.items", { n: 1 }), "1 elemento")
-        compare(Path.T.tr("count.items", { n: 2 }), "2 elementos")
-        Path.T.language = "ja"
-        compare(Path.T.tr("count.items", { n: 1 }), "1項目")
-        compare(Path.T.tr("count.items", { n: 2 }), "2項目")
     }
     function test_a_key_the_language_lacks_shows_english_and_one_nobody_has_shows_itself() {
         Path.T.language = "es"
-        Path.T.catalogs.es["only.in.english"] = undefined
         Path.T.catalogs.en["only.in.english"] = "the English words"
         compare(Path.T.tr("only.in.english"), "the English words")
         ignoreWarning(/T: no such key: nobody.has.this/)
@@ -51,10 +44,8 @@ TestCase {
     function test_a_numbered_error_is_said_in_the_language_and_an_unnumbered_one_as_it_came() {
         compare(Path.T.errorText({ n: 1202, params: { n: "1", total: "3", first: "a.txt (denied)", more: "0" }, message: "raw" }), "1 of 3 could not be copied: a.txt (denied)")
         compare(Path.T.errorText({ n: 1202, params: { n: "5", total: "9", first: "a, b, c", more: "2" }, message: "raw" }), "5 of 9 could not be copied: a, b, c, and 2 more — see the log")
-        Path.T.language = "es"
-        compare(Path.T.errorText({ n: 1230, params: {}, message: "cancelled" }), "Cancelado")
-        Path.T.language = "ja"
-        compare(Path.T.errorText({ n: 1220, params: {}, message: "same folder" }), "送信元と送信先が同じフォルダーです")
+        compare(Path.T.errorText({ n: 1230, params: {}, message: "cancelled" }), "Cancelled")
+        compare(Path.T.errorText({ n: 1220, params: {}, message: "same folder" }), "The source and the destination are the same folder")
         compare(Path.T.errorText({ message: "plain words from the daemon" }), "plain words from the daemon", "no number: the message as it came")
         compare(Path.T.errorText({ n: 9999, params: {}, message: "a number nobody has words for" }), "a number nobody has words for")
     }

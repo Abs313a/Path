@@ -83,14 +83,8 @@ TestCase {
         compare(muteTip.text, "Mute")
         video.muted = true
         compare(muteTip.text, "Unmute")
-        Path.T.language = "es"
-        compare(playTip.text, "Reproducir")
-        compare(muteTip.text, "Activar el sonido")
         video.muted = false
-        compare(muteTip.text, "Silenciar")
-        Path.T.language = "ja"
-        compare(playTip.text, "再生")
-        compare(muteTip.text, "ミュート")
+        compare(muteTip.text, "Mute")
     }
 
     // A file that is not there is refused by the backend before any decoding: the one failure

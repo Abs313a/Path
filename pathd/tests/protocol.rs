@@ -138,7 +138,7 @@ fn body(kind: &str) -> Value {
         "ShareTargets" => o.s("plugin", "tailscale").s("query", "phone"),
         "Share" => o.s("plugin", "mail").v("uris", uris()).s("target", "david@example.com").v("compose", Value::obj().s("subject", "Photos").done()),
         "ShareConfigure" => o.s("plugin", "mail").v("config", Value::obj().s("host", "smtp.example.com").done()).v("secrets", Value::obj().s("password", "hunter2").done()),
-        "AiConfigure" => o.s("provider", "omarchy").s("cliCommand", "claude"),
+        "AiConfigure" => o.s("provider", "anthropic").s("cliCommand", "claude"),
         "AiOpen" => o.s("dir", "file:///home/david/Projects").v("uris", uris()),
         "OpenTerminal" => o.s("dir", "file:///home/david/Projects"),
         "ChooserResult" => o.s("token", "t-1").v("uris", uris()),

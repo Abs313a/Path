@@ -1,12 +1,10 @@
 pragma Singleton
 import QtQuick
 import "i18n/en.js" as En
-import "i18n/es.js" as Es
-import "i18n/ja.js" as Ja
 
 QtObject {
     id: t
-    readonly property var catalogs: ({ en: En.strings, es: Es.strings, ja: Ja.strings })
+    readonly property var catalogs: ({ en: En.strings })
     property string language: pick(Qt.locale().uiLanguages)
 
     function pick(uiLanguages) {

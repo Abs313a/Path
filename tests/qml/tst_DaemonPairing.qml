@@ -17,8 +17,5 @@ TestCase {
         const said = Path.Daemon.pairing({ pathd: "0.1.1", version: 1 })
         verify(said.indexOf("0.1.1") >= 0 && said.indexOf(Version.version) >= 0, said)
         compare(Path.Daemon.pairing({ version: 1 }), "", "a daemon too old to say is taken at its word")
-        Path.T.language = "es"
-        verify(Path.Daemon.pairing({ pathd: "0.1.1" }).indexOf("reinicia") >= 0, "in the window's language")
-        Path.T.language = "en"
     }
 }

@@ -117,7 +117,7 @@ def main() -> int:
         if missing:
             failures.append(f"{name} missing canonical text: " + ", ".join(missing))
 
-    for language in ("en", "es", "ja"):
+    for language in ("en",):
         name = f"qml/path/i18n/{language}.js"
         if not (ROOT / name).is_file():
             failures.append(f"missing display catalog: {name}")

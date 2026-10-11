@@ -119,7 +119,7 @@ pub fn settings() -> Value {
     m.insert("editor".into(), Value::obj().s("terminal", "auto").s("placement", "right").done());
     m.insert("git".into(), Value::obj().b("enabled", true).s("showIgnored", "dim").s("folders", "aggregate").done());
     m.insert("project".into(), Value::obj().u("width", 320).b("arrange", true).b("agent", true).done());
-    m.insert("jarvis".into(), Value::obj().s("provider", "omarchy").s("cliCommand", "").done());
+    m.insert("jarvis".into(), Value::obj().s("provider", "anthropic").s("cliCommand", "").done());
     m.insert("index".into(), Value::obj().v("roots", Value::Arr(vec![])).v("excludes", Value::Arr(vec![])).done());
     m.insert("integration".into(), Value::obj().b("asked", false).done());
     m.insert("mirror".into(), Value::obj().v("last", Value::obj().done()).done());

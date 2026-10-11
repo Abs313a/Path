@@ -21,7 +21,7 @@ TestCase {
         wasView = Path.Settings.view; wasProject = Path.Settings.project; wasJarvis = Path.Settings.jarvis
         Path.Settings.view = Object.assign({}, Path.Settings.view, { "default": "list" })
         Path.Settings.project = ({ width: 320, arrange: true, agent: true })
-        Path.Settings.jarvis = ({ provider: "omarchy", cliCommand: "" })
+        Path.Settings.jarvis = ({ provider: "anthropic", cliCommand: "" })
         Wire.reset(); Wire.connectAll()
         sw.open("general")
         Wire.reset()
@@ -141,12 +141,12 @@ TestCase {
     function test_choosing_the_ai_provider_goes_through_the_daemon() {
         sw.page = "ai"
         const choice = control("ai-provider")
-        compare(choice.value, "omarchy", "the shipped default: whatever Omarchy's own keybinding uses")
+        compare(choice.value, "anthropic", "the shipped default")
         Wire.reset()
-        choice.picked("anthropic")
+        choice.picked("openai")
         const r = Wire.last("AiConfigure")
         verify(r !== null)
-        compare(r.provider, "anthropic")
+        compare(r.provider, "openai")
         compare(Wire.count("SetSettings"), 0, "the panel does not write this one itself: the daemon owns the key")
         compare(Wire.count("Settings"), 0, "and nothing is read back before the daemon has answered")
         Wire.replyTo("AiConfigure", {})
@@ -155,11 +155,11 @@ TestCase {
         compare(sw.flash, "Saved")
         // What that line says is the daemon's answer, not a guess: until it has one, the page
         // says what is missing rather than that everything is ready.
-        Wire.replyTo("AiStatus", { configured: true, provider: "anthropic", cli: "claude" })
-        compare(Path.Settings.jarvis.provider, "omarchy", "the file still says what it said: only a Settings reply changes it")
-        Wire.replyTo("Settings", { jarvis: { provider: "anthropic" } })
-        compare(Path.Settings.jarvis.provider, "anthropic")
-        compare(choice.value, "anthropic")
+        Wire.replyTo("AiStatus", { configured: true, provider: "openai", cli: "codex" })
+        compare(Path.Settings.jarvis.provider, "anthropic", "the file still says what it said: only a Settings reply changes it")
+        Wire.replyTo("Settings", { jarvis: { provider: "openai" } })
+        compare(Path.Settings.jarvis.provider, "openai")
+        compare(choice.value, "openai")
     }
 
     // ---------------------------------------------------------------- Share: a plugin's own form
