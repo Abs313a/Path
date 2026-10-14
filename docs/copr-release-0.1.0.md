@@ -1,4 +1,61 @@
-# Path 0.1.0 COPR preparation
+# Path 0.1.0 COPR publication
+
+## Published result (2026-10-14)
+
+The user approved publication. [COPR build 11124506](https://copr.fedorainfracloud.org/coprs/build/11124506/)
+succeeded for Fedora 43 and Fedora 44 x86_64. The final source pin is
+`f6b8ce8457c63d2fd0a65f365e3c083deef45603`, RPM version/release
+`0.1.0-0.5.gitf6b8ce8457c6` (with the target Fedora dist suffix).
+The `v0.1.0` GitHub tag is unchanged.
+
+Both COPR builds passed 260 Rust tests, zero failures and one existing ignored
+test, plus the packaging, license, i18n, version and desktop-file checks.
+[Final build/test CI](https://github.com/ChrisTitusTech/Path/actions/runs/38636689680)
+passed on x86_64 and aarch64, including QML tests. Python, Rust and Actions
+CodeQL checks passed on the same final source commit.
+
+The publishing workflow is [run 38636757250](https://github.com/ChrisTitusTech/copr-fedora/actions/runs/38636757250).
+The final manifest is in `copr-fedora` commit `0612d5e`. Other packages rebuilt
+by the earlier shared-validator change also succeeded: gamescope, linutil,
+github-copilot-installer and plazmic-legends.
+
+Publication exposed three environment/integration gaps, fixed without bypassing
+validation or disabling tests:
+
+- The publisher repeated a layout-only check before source preparation. Commit
+  `439e18d` in copr-fedora makes publication use full prepared-SRPM validation
+  and adds regression coverage (26 validator tests pass).
+- A clean COPR source worker initially has no Git. Path commit `99aa825` resolves
+  the source pin only after installing tools; a missing-Git regression test
+  exercises this ordering. Build 11124441 failed before this fix.
+- COPR mock exposes no usable block volumes. Path commit `f6b8ce8` removes the
+  unrelated host-volume assertion from the favorites test and tests filesystem
+  capacity through a temporary directory, plus fixture-based empty-device
+  handling. Both targets of build 11124458 had failed only that unit assertion.
+
+The final RPM release was increased to 0.5. Runtime application behavior and
+Cargo dependencies are unchanged from the reviewed release; the Rust changes
+are confined to tests. Superseded workflow runs were canceled to avoid duplicate
+submissions; the failed COPR attempts remain visible in build history.
+
+Both signed RPMs were installed from the public COPR repositories with DNF,
+with GPG signature verification enabled and no dependency overrides. The installed
+version, exact SOURCE-COMMIT, RPM integrity, plugin/helper paths, socket mode 0600
+and daemon Hello request passed on both Fedora targets. Fedora 43 used the
+selected errornointernet/quickshell repository; Fedora 44 used its standard
+Quickshell package. These checks used disposable runtimes, not the host desktop.
+
+Evidence is retained locally under `target/copr-publication/`: `workflow.log`,
+`ci.log`, `build43.log`, `build44.log`, `install43.log`, and `install44.log`.
+The runtimes had no session D-Bus, so the helper's missing-bus log is expected;
+full graphical desktop and systemd-user activation acceptance remain outside
+these installation/daemon checks.
+
+## Historical preparation record
+
+The remainder records validation before publication, including the previous
+`e8548b9` candidate and the approval boundary that applied at that time. The
+published pin and result above supersede that candidate and stop point.
 
 COPR submission is a separate approval step. The validator and package manifest
 in the local `copr-fedora` checkout must not be pushed until publication is

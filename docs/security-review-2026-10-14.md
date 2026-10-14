@@ -1,5 +1,8 @@
 # Security remediation and Fedora validation
 
+This is the original pre-publication record. See [the final COPR publication
+record](copr-release-0.1.0.md) for subsequent approval, fixes and successful builds.
+
 Public COPR publication remains unapproved. No package was submitted to COPR.
 The target installation environments are Fedora 43 and Fedora 44, x86_64.
 

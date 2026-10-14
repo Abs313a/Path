@@ -53,6 +53,24 @@
 
 ## Installation
 
+### Fedora 43 and 44 (x86_64)
+
+Packages are available in [christitustech/copr-fedora](https://copr.fedorainfracloud.org/coprs/christitustech/copr-fedora/).
+On Fedora 43, first enable the Quickshell dependency repository:
+
+```bash
+sudo dnf copr enable errornointernet/quickshell
+```
+
+Then, on Fedora 43 or 44:
+
+```bash
+sudo dnf copr enable christitustech/copr-fedora
+sudo dnf install path
+```
+
+Fedora 44 provides Quickshell in its standard repositories.
+
 ### Building from Source (`Makefile`)
 Standard build and installation with GNU Make:
 
