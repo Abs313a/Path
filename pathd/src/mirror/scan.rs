@@ -55,11 +55,16 @@ pub fn scan_side_counting(side: &Side, rules: &[Rule], filtered_count: &mut usiz
             // Try one recursive Scan; fall back to per-directory.
             let req = session.req("Scan").s("path", root.clone()).b("recursive", true).done();
             let mut got_recursive = true;
+            let mut invalid = None;
             let r = session.plugin.request_stream_with(req, Some(w.cancel), |m| {
                 if let Msg::Json(v) = m {
                     if let Some(entries) = v.get("entries").and_then(Value::as_arr) {
                         for e in entries {
                             let rel = e.str_field("rel").map(str::to_string).unwrap_or_else(|| e.str_field("name").unwrap_or("").to_string());
+                            if let Err(e) = validate_rel(&rel) {
+                                invalid = Some(e);
+                                continue;
+                            }
                             let kind = e.str_field("kind").unwrap_or("file");
                             if kind == "link" {
                                 continue;
@@ -83,6 +88,9 @@ pub fn scan_side_counting(side: &Side, rules: &[Rule], filtered_count: &mut usiz
                     }
                 }
             });
+            if let Some(e) = invalid {
+                return Err(e);
+            }
             match r {
                 Ok(_) => {}
                 Err(VfsError::Unsupported) => got_recursive = false,
@@ -133,11 +141,16 @@ fn scan_remote(session: &Arc<Session>, root: &str, prefix: &str, w: &mut Walk, o
     let req = session.req("Scan").s("path", path).done();
     let mut dirs = Vec::new();
     let mut missing_meta = Vec::new();
+    let mut invalid = None;
     session.plugin.request_stream_with(req, Some(w.cancel), |m| {
         if let Msg::Json(v) = m {
             if let Some(entries) = v.get("entries").and_then(Value::as_arr) {
                 for e in entries {
                     let name = e.str_field("name").unwrap_or("").to_string();
+                    if let Err(e) = validate_name(&name) {
+                        invalid = Some(e);
+                        continue;
+                    }
                     let kind = e.str_field("kind").unwrap_or("file");
                     if kind == "link" {
                         continue;
@@ -162,6 +175,9 @@ fn scan_remote(session: &Arc<Session>, root: &str, prefix: &str, w: &mut Walk, o
             }
         }
     })?;
+    if let Some(e) = invalid {
+        return Err(e);
+    }
     for rel in missing_meta {
         let v = session.plugin.request(session.req("Stat").s("path", join_rel(root, &rel)).done())?;
         let m = crate::vfs::remote::meta_from(&v);
@@ -196,7 +212,7 @@ pub(super) fn fill_local_digests(side: &Side, mine: &mut SideMap, other: &SideMa
         }
         if let Some(e) = mine.get_mut(rel) {
             if !e.is_dir && e.size == o.size && e.digest.is_none() {
-                if let Ok(mut f) = std::fs::File::open(root.join(rel)) {
+                if let Ok(mut f) = local_path(root, rel).and_then(|p| open_source(&p.path)) {
                     e.digest = crate::md5::hex_reader(&mut f, cancel).ok().flatten();
                 }
             }

@@ -60,8 +60,7 @@ fn a_plugin_killed_mid_read_fails_the_job_and_the_next_request_gets_a_new_one() 
     let id = jobs::submit(Value::obj().s("op", "copy").v("items", Value::Arr(vec![Value::Str("stub://lab/slow.bin".into())])).s("dest", Uri::from_path(&dst).to_string()).done(), Some(tx)).unwrap();
 
     // Bytes are landing in the part file: the `Read` is in flight, and some of it has arrived.
-    let part = dst.join("slow.bin.path-part");
-    until("the download started", || std::fs::metadata(&part).map(|m| m.len() > 0).unwrap_or(false));
+    until("the download started", || std::fs::read_dir(&dst).unwrap().flatten().any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false)));
     doomed.kill_group();
 
     let j = finished(id, Duration::from_secs(20));
@@ -71,7 +70,7 @@ fn a_plugin_killed_mid_read_fails_the_job_and_the_next_request_gets_a_new_one() 
     assert!(err.contains("plugin exited"), "and says what went wrong, in words: {err}");
     // What half arrived is not left lying about under the real name or the part name.
     assert!(!dst.join("slow.bin").exists(), "no short file under the name the user asked for");
-    assert!(!part.exists(), "and no part file left behind");
+    assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0, "and no part file left behind");
     // The same sentence is in the job's log, which is what the activity view's Log button opens.
     let log = pathd::joblog::read_job(id, 0).map(|l| pathd::json::to_string(&l)).unwrap_or_default();
     assert!(log.contains("plugin exited"), "the log says it too: {log}");

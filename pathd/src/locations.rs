@@ -257,8 +257,8 @@ fn secrets_for(location: &Value) -> Value {
 }
 
 /// A plugin that verifies certificates itself refuses one nobody has accepted, and the refusal
-/// IS the fingerprint (`Invalid`, field `fingerprint`). SFTP answers the same question with a
-/// reply instead. Either way it is "here is the key; has anyone said yes to it?".
+/// IS the fingerprint (`Invalid`, field `fingerprint`). SFTP uses the same refusal before
+/// authentication: "here is the key; has anyone said yes to it?".
 pub(crate) fn unaccepted_fingerprint(e: &VfsError) -> Option<String> {
     match e {
         VfsError::Io(m) => m.strip_prefix("Invalid/fingerprint: ").filter(|f| !f.is_empty()).map(str::to_string),

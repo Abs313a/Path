@@ -37,6 +37,7 @@ stub = []
 [dependencies]
 path-json = { path = "../crates/path-json" }
 libc = "0.2"
+tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 png = "0.17"
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }

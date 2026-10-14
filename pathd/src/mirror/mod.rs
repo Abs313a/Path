@@ -326,7 +326,9 @@ mod diff;
 mod execute;
 mod filters;
 mod report;
+pub(crate) mod safety;
 mod scan;
+use safety::{local_path, open_source, validate_name, validate_rel};
 mod store;
 #[cfg(test)]
 mod tests;

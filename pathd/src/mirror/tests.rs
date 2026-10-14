@@ -640,13 +640,13 @@ fn the_guards_refuse_before_anything_is_deleted() {
         error: None,
     });
     let err = execute(&Arc::new(Mutex::new(plan)), &s, &ctx).err().expect("a path climbing out of the replica is refused");
-    assert!(err.message().contains("outside the replica root"), "{}", err.message());
+    assert!(err.message().contains("unsafe relative transfer path"), "{}", err.message());
 
     // And so is an absolute one.
     let mut plan = diff(&m, &r, &s, Detector::SizeOnly, 0).unwrap();
     plan.actions
         .push(Action { rel: "/etc/passwd".into(), kind: ActionKind::Delete, reason: Reason::Extra, master: None, replica: None, bytes: 0, checked: true, state: State::Pending, progress: 0, error: None });
-    assert!(execute(&Arc::new(Mutex::new(plan)), &s, &ctx).err().expect("an absolute path is refused").message().contains("outside the replica root"));
+    assert!(execute(&Arc::new(Mutex::new(plan)), &s, &ctx).err().expect("an absolute path is refused").message().contains("unsafe relative transfer path"));
 
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -809,4 +809,28 @@ fn a_cancelled_compare_gives_up_on_the_file_it_is_hashing() {
     scan::fill_local_digests(&side, &mut mine, &other, &cancel);
     assert_eq!(mine.get("a.bin").unwrap().digest, None, "a cancelled compare hashes nothing");
     std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn copies_reject_traversal_and_do_not_follow_destination_links() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("source"), b"new data").unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, b"preserve").unwrap();
+    std::os::unix::fs::symlink(&victim, root.path().join("dest")).unwrap();
+    std::os::unix::fs::symlink(&victim, root.path().join("dest.path-part")).unwrap();
+    let cancel = AtomicBool::new(false);
+    let ctx = ExecCtx { cancel: &cancel, workers: 1, on_change: &|_| {}, on_bytes: &|_| {}, exact_times: false };
+    let (m, r) = (Side::Local(src.path().into()), Side::Local(root.path().into()));
+    for bad in ["../victim", "/tmp/victim", "a/../../victim", ""] {
+        assert!(copy_file(&m, "source", &r, bad, 8, 0, &ctx).is_err());
+        assert!(copy_file(&m, bad, &r, "dest", 8, 0, &ctx).is_err());
+    }
+    copy_file(&m, "source", &r, "dest", 8, 0, &ctx).unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"preserve");
+    assert_eq!(std::fs::read(root.path().join("dest")).unwrap(), b"new data");
+    assert_eq!(std::fs::metadata(root.path().join("dest")).unwrap().permissions().mode() & 0o777, 0o600);
 }

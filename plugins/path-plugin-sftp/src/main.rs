@@ -112,7 +112,10 @@ fn known_hosts_says(host: &str, port: u16, key: &russh::keys::PublicKey) -> Know
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, key: &russh::keys::PublicKey) -> std::result::Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, offered: &russh::keys::PublicKeyOrCertificate) -> std::result::Result<bool, Self::Error> {
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = offered else {
+            return Ok(false); // Certificate authorities are not part of Path's trust model.
+        };
         let fp = key.fingerprint(HashAlg::Sha256).to_string();
         *self.seen.lock().unwrap() = Some(fp.clone());
         // A key the user has already accepted for this location: it must be that key and no other.
@@ -136,9 +139,9 @@ impl client::Handler for ClientHandler {
                 *self.refused.lock().unwrap() = Some(format!("~/.ssh/known_hosts records a different key for this host (line {line})"));
                 Ok(false)
             }
-            // Unknown to ssh as well. The key is reported back with the reply; path shows it to
-            // the user, and once they accept it, saves it as `trustedFingerprint`.
-            KnownHosts::Unknown => Ok(true),
+            // Unknown to ssh as well: stop the handshake before any authentication.
+            // The fingerprint error asks the user to pin this key before reconnecting.
+            KnownHosts::Unknown => Ok(false),
         }
     }
 }
@@ -770,7 +773,13 @@ impl Handler for Sftp {
                         let got = seen.lock().unwrap().clone().unwrap_or_default();
                         Err(PluginError::auth(format!("the host key of {host} has changed — it offered {got}, and {why}. Verify the server before connecting again.")))
                     }
-                    None => Err(e),
+                    None => {
+                        let fingerprint = seen.lock().unwrap().clone();
+                        match fingerprint.filter(|_| pinned.is_none() && !*known.lock().unwrap()) {
+                            Some(fp) => Err(PluginError::invalid("fingerprint", fp)),
+                            None => Err(e),
+                        }
+                    }
                 };
             }
         };

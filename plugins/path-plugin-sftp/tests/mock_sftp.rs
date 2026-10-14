@@ -9,7 +9,7 @@ use path_plugin_sdk::json::{self, Value};
 use path_plugin_sdk::{read_frame, write_binary, write_json};
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Write};
@@ -123,6 +123,7 @@ struct Counters {
     execs: AtomicUsize,
     /// Successful sign-ins: how many connections this server has really been given.
     auths: AtomicUsize,
+    auth_attempts: AtomicUsize,
 }
 
 struct MockCfg {
@@ -265,6 +266,7 @@ impl russh::server::Handler for SshSession {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.counters.auth_attempts.fetch_add(1, Ordering::SeqCst);
         let ok = !self.cfg.auth.no_password_method && user == "path" && password == "secret";
         if ok {
             self.counters.auths.fetch_add(1, Ordering::SeqCst);
@@ -273,6 +275,7 @@ impl russh::server::Handler for SshSession {
     }
 
     async fn auth_publickey(&mut self, user: &str, key: &russh::keys::PublicKey) -> Result<Auth, Self::Error> {
+        self.counters.auth_attempts.fetch_add(1, Ordering::SeqCst);
         let offered = key.to_openssh().unwrap_or_default();
         OFFERED.lock().unwrap().push(offered.clone());
         let blob = |k: &str| k.split_whitespace().nth(1).unwrap_or("").to_string();
@@ -281,6 +284,7 @@ impl russh::server::Handler for SshSession {
     }
 
     async fn auth_keyboard_interactive<'a>(&'a mut self, user: &str, _submethods: &str, response: Option<russh::server::Response<'a>>) -> Result<Auth, Self::Error> {
+        self.counters.auth_attempts.fetch_add(1, Ordering::SeqCst);
         if !self.cfg.auth.interactive {
             return Ok(Auth::Reject { proceed_with_methods: None, partial_success: false });
         }
@@ -293,9 +297,10 @@ impl russh::server::Handler for SshSession {
         }
     }
 
-    async fn channel_open_session(&mut self, channel: Channel<Msg>, _session: &mut Session) -> Result<bool, Self::Error> {
+    async fn channel_open_session(&mut self, channel: Channel<Msg>, reply: russh::server::ChannelOpenHandle, _session: &mut Session) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn subsystem_request(&mut self, channel_id: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
@@ -334,7 +339,7 @@ impl russh::server::Handler for SshSession {
         let (out, status) = self.emulate(&cmd);
         session.channel_success(channel_id)?;
         for chunk in out.chunks(32 * 1024) {
-            session.data(channel_id, CryptoVec::from(chunk.to_vec()))?;
+            session.data(channel_id, chunk.to_vec())?;
         }
         session.exit_status_request(channel_id, status)?;
         session.eof(channel_id)?;
@@ -548,6 +553,8 @@ impl russh_sftp::server::Handler for SftpFs {
     }
 }
 
+static HOST_KEYS: Mutex<BTreeMap<u16, String>> = Mutex::new(BTreeMap::new());
+
 fn start(exec: ExecMode, fail: ExecFail, page: usize) -> Mock {
     start_auth(exec, fail, page, AuthMode::default())
 }
@@ -559,8 +566,9 @@ fn start_auth(exec: ExecMode, fail: ExecFail, page: usize, auth: AuthMode) -> Mo
     let port = std_listener.local_addr().unwrap().port();
     std_listener.set_nonblocking(true).unwrap();
     let server = MockServer { fs: fs.clone(), cfg: Arc::new(MockCfg { exec, fail, page, auth }), counters: counters.clone() };
-    let host_private = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519).unwrap();
+    let host_private = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
     let host_key = host_private.public_key().to_openssh().unwrap();
+    HOST_KEYS.lock().unwrap().insert(port, host_private.public_key().fingerprint(russh::keys::HashAlg::Sha256).to_string());
     let thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
@@ -581,13 +589,16 @@ struct Plugin {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next: u64,
+    pin_fixture: bool,
     /// The wire lines the plugin logged (`PATHFM_PLUGIN_LOG`), kept out of `req`'s frames.
     log: Vec<String>,
 }
 
 impl Plugin {
     fn spawn() -> Plugin {
-        Plugin::spawn_with(None)
+        let mut p = Plugin::spawn_with(None);
+        p.pin_fixture = true;
+        p
     }
 
     /// `known_hosts` points the plugin at a fixture instead of the real `~/.ssh/known_hosts`.
@@ -597,7 +608,9 @@ impl Plugin {
 
     /// With the library log asked for, as the daemon asks: `Log` events between the frames.
     fn spawn_logging() -> Plugin {
-        Plugin::spawn_all(None, true)
+        let mut p = Plugin::spawn_all(None, true);
+        p.pin_fixture = true;
+        p
     }
 
     fn spawn_all(known_hosts: Option<&std::path::Path>, log: bool) -> Plugin {
@@ -619,11 +632,19 @@ impl Plugin {
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().expect("spawn plugin");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Plugin { child, stdin, stdout, next: 1, log: Vec::new() }
+        Plugin { child, stdin, stdout, next: 1, pin_fixture: false, log: Vec::new() }
     }
 
     /// Sends a request; returns (streamed JSON frames, final reply).
     fn req(&mut self, mut v: Value) -> (Vec<Value>, Value) {
+        if self.pin_fixture && v.str_field("type") == Some("Connect") {
+            if let Value::Obj(m) = &mut v {
+                if let Some(Value::Obj(config)) = m.get_mut("config") {
+                    let port = config.get("port").and_then(Value::as_str).unwrap().parse::<u16>().unwrap();
+                    config.entry("trustedFingerprint".into()).or_insert_with(|| Value::Str(HOST_KEYS.lock().unwrap()[&port].clone()));
+                }
+            }
+        }
         let id = self.next;
         self.next += 1;
         if let Value::Obj(m) = &mut v {
@@ -972,9 +993,15 @@ fn a_host_in_known_hosts_is_accepted_and_reported() {
 fn an_unknown_host_is_reported_for_the_user_to_verify() {
     let m = start(ExecMode::Refused, ExecFail::None, 0);
     let mut p = Plugin::spawn_with(None);
-    let ok = p.connect(m.port, "secret").get("ok").cloned().expect("connect");
-    assert_eq!(ok.get("knownHost").and_then(Value::as_bool), Some(false));
-    assert!(ok.str_field("fingerprint").unwrap().starts_with("SHA256:"));
+    let reply = p.connect(m.port, "secret");
+    let err = reply.get("err").expect("unknown host must stop the handshake");
+    assert_eq!(err.str_field("field"), Some("fingerprint"));
+    let fp = err.str_field("message").unwrap();
+    assert!(fp.starts_with("SHA256:"));
+    assert_eq!(m.counters.auth_attempts.load(Ordering::SeqCst), 0);
+    let reply = p.connect_cfg(m.port, "secret", &[("trustedFingerprint", fp)]);
+    assert!(reply.get("ok").is_some());
+    assert_eq!(m.counters.auth_attempts.load(Ordering::SeqCst), 1);
 }
 
 /// known_hosts has a different key of the same kind for this host — ssh's "identification has
@@ -982,7 +1009,7 @@ fn an_unknown_host_is_reported_for_the_user_to_verify() {
 #[test]
 fn a_key_that_known_hosts_disagrees_with_is_refused() {
     let m = start(ExecMode::Refused, ExecFail::None, 0);
-    let other = PrivateKey::random(&mut rand::thread_rng(), Algorithm::Ed25519).unwrap().public_key().to_openssh().unwrap();
+    let other = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap().public_key().to_openssh().unwrap();
     let kh = known_hosts_file("changed", m.port, &other);
     let mut p = Plugin::spawn_with(Some(&kh));
     let r = p.connect(m.port, "secret");
@@ -999,7 +1026,7 @@ fn a_key_that_known_hosts_disagrees_with_is_refused() {
 fn a_pinned_key_must_match() {
     let m = start(ExecMode::Refused, ExecFail::None, 0);
     let mut p = Plugin::spawn_with(None);
-    let fp = p.connect(m.port, "secret").get("ok").cloned().expect("connect").str_field("fingerprint").unwrap().to_string();
+    let fp = p.connect(m.port, "secret").get("err").cloned().expect("trust required").str_field("message").unwrap().to_string();
     p.ok(Value::obj().s("type", "Disconnect").s("location", "lab").s("role", "browse").done());
 
     // The key it offers: accepted.

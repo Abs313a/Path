@@ -304,6 +304,16 @@ fn main() {
                 });
                 continue;
             }
+            // Malicious server fixture: both recursive and per-directory scan paths must reject it.
+            "Scan" if std::env::var_os("PATHFM_STUB_UNSAFE_SCAN").is_some() && path.starts_with("/unsafe") => {
+                if path == "/unsafe-fallback" && v.get("recursive").and_then(Value::as_bool).unwrap_or(false) {
+                    err(id, "Unsupported", "use directory scan")
+                } else {
+                    let entry = Value::obj().s("name", "../outside").s("rel", "../outside").s("kind", "file").done();
+                    send(&out, &Value::obj().u("id", id).v("entries", Value::Arr(vec![entry])).done());
+                    ok(id, Value::obj().u("n", 1).done())
+                }
+            }
             // API-PLUGIN: a plugin that cannot walk a whole tree in one request says so, and the
             // daemon lists directory by directory. Answering the top level and calling it
             // recursive would leave every mirror re-copying the files it never saw.

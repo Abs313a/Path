@@ -33,7 +33,7 @@ pub fn presets() -> Vec<Value> {
             true,
             "both",
             Some("editor"),
-            Some("nvim --server {socket} --remote-send '<Esc>:e {file}<CR>:{line}<CR>'"),
+            Some("nvim-rpc"),
             true,
         ),
         t("helix", "Helix", "hx", "hx {file}:{line}", true, "file", None, None, false),
@@ -244,6 +244,23 @@ fn alive(s: &mut Session) -> bool {
     matches!(s.child.try_wait(), Ok(None))
 }
 
+/// Build a Vim expression from character numbers, so filenames cannot introduce Ex commands,
+/// expression syntax, or remote-send keycodes. The expression is passed as one argv element.
+fn nvim_expression(path: &str, line: u64) -> String {
+    let chars = path.chars().map(|c| (c as u32).to_string()).collect::<Vec<_>>().join(",");
+    format!("execute('edit ' . fnameescape(join(map([{chars}], 'nr2char(v:val)'), ''))) . execute('call cursor({}, 1)')", line.max(1))
+}
+
+fn nvim_reuse(uris: &[Uri], line: Option<u64>) -> Result<Command, String> {
+    if uris.iter().any(|u| !u.is_local()) {
+        return Err("only local files can be opened in Neovim".into());
+    }
+    let path = uris.first().map(Uri::to_path).unwrap_or_else(crate::config::home);
+    let mut cmd = Command::new("nvim");
+    cmd.arg("--server").arg(socket_path("neovim").map_err(|e| e.to_string())?).arg("--remote-expr").arg(nvim_expression(&path.to_string_lossy(), line.unwrap_or(1)));
+    Ok(cmd)
+}
+
 /// Launches (or reuses) the tool; returns (pid, reused).
 pub fn open(id_or_role: &str, uris: &[Uri], line: Option<u64>) -> Result<(u32, bool), String> {
     let tool = find(id_or_role).ok_or_else(|| format!("no tool {id_or_role}"))?;
@@ -256,7 +273,14 @@ pub fn open(id_or_role: &str, uris: &[Uri], line: Option<u64>) -> Result<(u32, b
     if running {
         if let Some(reuse) = tool.str_field("reuse") {
             let p = prepare(&tool, uris, line, reuse)?;
-            let st = Command::new("sh").arg("-c").arg(&p.command).current_dir(&p.cwd).envs(p.env.clone()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|e| e.to_string())?;
+            let mut cmd = if id == "neovim" {
+                nvim_reuse(uris, line)?
+            } else {
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c").arg(&p.command);
+                cmd
+            };
+            let st = cmd.current_dir(&p.cwd).envs(p.env.clone()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|e| e.to_string())?;
             if !st.success() {
                 return Err(format!("reuse command failed: {}", p.command));
             }
@@ -331,6 +355,36 @@ pub fn write_tools(list: &[Value]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neovim_treats_hostile_filenames_as_data() {
+        if !on_path("nvim") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let result = dir.path().join("result");
+        for name in ["$(touch PWNED)", "x';touch PWNED;'", "x|call writefile([], 'PWNED')", "x<CR>:!touch PWNED<CR>", "line\nbreak", "quote\" and \\ slash"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+            let status = Command::new("nvim")
+                .args(["--headless", "-u", "NONE", "-i", "NONE", "-n"])
+                .arg("-c")
+                .arg(format!("call eval('{}')", nvim_expression(&path.to_string_lossy(), 2).replace('\'', "''")))
+                .arg("-c")
+                .arg(format!("call writefile([json_encode([expand('%:p'), line('.')])], '{}')", result.display()))
+                .args(["-c", "qa!"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+            let got = crate::json::parse(std::fs::read(&result).unwrap().as_slice()).unwrap();
+            assert_eq!(got, Value::Arr(vec![Value::Str(path.to_string_lossy().into_owned()), Value::Uint(2)]));
+            assert!(!dir.path().join("PWNED").exists());
+            let cmd = nvim_reuse(&[Uri::from_path(&path)], Some(2)).unwrap();
+            assert_eq!(cmd.get_program(), "nvim");
+            assert_eq!(cmd.get_args().count(), 4);
+        }
+    }
 
     #[test]
     fn substitutes_and_quotes() {
