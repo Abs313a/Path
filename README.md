@@ -53,7 +53,7 @@
 
 ## Installation
 
-### Fedora 43 and 44 (x86_64)
+### Fedora 43 and 44 via COPR (x86_64)
 
 Packages are available in [christitustech/copr-fedora](https://copr.fedorainfracloud.org/coprs/christitustech/copr-fedora/).
 On Fedora 43, first enable the Quickshell dependency repository:
@@ -70,6 +70,32 @@ sudo dnf install path
 ```
 
 Fedora 44 provides Quickshell in its standard repositories.
+
+### Direct RPM Installation (x86_64)
+
+Download the package for your Fedora version from the [latest release](https://github.com/ChrisTitusTech/Path/releases/latest):
+
+| Fedora | RPM download |
+| --- | --- |
+| 43 | [Path 0.1.0 for Fedora 43](https://github.com/ChrisTitusTech/Path/releases/download/v0.1.0/path-0.1.0-0.5.gitf6b8ce8457c6.fc43.x86_64.rpm) |
+| 44 | [Path 0.1.0 for Fedora 44](https://github.com/ChrisTitusTech/Path/releases/download/v0.1.0/path-0.1.0-0.5.gitf6b8ce8457c6.fc44.x86_64.rpm) |
+
+On Fedora 43, enable the Quickshell repository first:
+
+```bash
+sudo dnf copr enable errornointernet/quickshell
+sudo dnf install ./path-0.1.0-0.5.gitf6b8ce8457c6.fc43.x86_64.rpm
+```
+
+On Fedora 44:
+
+```bash
+sudo dnf install ./path-0.1.0-0.5.gitf6b8ce8457c6.fc44.x86_64.rpm
+```
+
+Run these commands from the download directory. DNF installs the required dependencies.
+The release assets are the signed packages from COPR build [11124506](https://copr.fedorainfracloud.org/coprs/build/11124506/); `SHA256SUMS` is provided alongside them.
+Enable the Path COPR repository above to receive future updates through DNF.
 
 ### Building from Source (`Makefile`)
 Standard build and installation with GNU Make:
@@ -134,3 +160,8 @@ make test-qml
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## Fork History
+
+[ChrisTitusTech/Path](https://github.com/ChrisTitusTech/Path) is a fork of [Abs313a/Path](https://github.com/Abs313a/Path), which is itself a fork of the original [greyhorsesoftware/Kiki](https://github.com/greyhorsesoftware/Kiki) project.
+Credit goes to the original Kiki authors and Abs313a for the work this fork builds on. The project remains available under the MIT License.
