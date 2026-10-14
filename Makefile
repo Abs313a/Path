@@ -85,6 +85,7 @@ lint: clippy
 	python3 tests/identity_check.py
 	python3 tests/branding_check.py
 	python3 tests/packaging_hooks_check.py
+	python3 tests/copr_source_check.py
 	python3 tests/fedora_packaging_check.py
 	python3 tests/fedora_license_check.py
 	python3 tests/i18n_check.py
