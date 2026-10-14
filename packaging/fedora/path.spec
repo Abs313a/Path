@@ -5,7 +5,7 @@
 
 Name:           path
 Version:        0.1.0
-Release:        0.4%{?path_commit:.git%{path_commit}}%{?dist}
+Release:        0.5%{?path_commit:.git%{path_commit}}%{?dist}
 Summary:        Light, practical file manager with a Quickshell interface
 License:        ((MIT OR Apache-2.0) AND Unicode-3.0) AND (0BSD OR MIT OR Apache-2.0) AND Apache-2.0 AND (Apache-2.0 AND ISC) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND BSD-3-Clause AND (BSD-3-Clause OR Apache-2.0) AND CDLA-Permissive-2.0 AND ISC AND MIT AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND (Unlicense OR MIT) AND Zlib AND (Zlib OR Apache-2.0 OR MIT)
 URL:            https://github.com/ChrisTitusTech/Path
@@ -129,5 +129,8 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/pathfm.desktop
 %{_datadir}/xdg-desktop-portal/portals/path.portal
 
 %changelog
+* Wed Oct 14 2026 Chris Titus <contact@christitus.com> - 0.1.0-0.5
+- Test filesystem capacity without requiring visible block devices in mock.
+
 * Wed Oct 14 2026 Chris Titus <contact@christitus.com> - 0.1.0-0.4
 - Integrate generated SRPM sources with COPR validation.

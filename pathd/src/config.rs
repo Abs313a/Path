@@ -406,7 +406,6 @@ mod tests {
         let s = settings();
         assert_eq!(s.get("view").unwrap().str_field("default"), Some("icon"));
         assert_eq!(s.get("view").unwrap().str_field("sort"), Some("name")); // default kept
-        assert!(volumes().as_arr().unwrap().iter().any(|v| v.u64_field("total").unwrap_or(0) > 0));
         std::fs::remove_dir_all(&dir).unwrap();
         std::env::remove_var("PATHFM_CONFIG_DIR");
     }
@@ -482,6 +481,24 @@ mod tests {
 
 #[cfg(test)]
 mod volume_tests {
+    #[test]
+    fn filesystem_space_does_not_require_visible_block_devices() {
+        // Mock/COPR can expose only tmpfs/overlay mounts, which volumes() correctly
+        // omits. Query a known directory to test capacity independently of that list.
+        let dir = tempfile::tempdir().unwrap();
+        let (free, total) = super::fs_space(dir.path().to_str().unwrap());
+        assert!(total > 0);
+        assert!(free <= total);
+        assert_eq!(super::fs_space(dir.path().join("missing").to_str().unwrap()), (0, 0));
+        assert_eq!(super::fs_space("invalid\0path"), (0, 0));
+    }
+
+    #[test]
+    fn no_visible_block_devices_is_a_valid_empty_list() {
+        assert!(super::unmounted_from_lsblk(r#"{"blockdevices":[]}"#).is_empty());
+        assert!(super::unmounted_from_lsblk("invalid json").is_empty());
+    }
+
     #[test]
     fn unmounted_partitions_from_lsblk() {
         let json = r#"{"blockdevices":[{"path":"/dev/sda","label":null,"fstype":null,"mountpoint":null,"rm":false,"size":"1T","type":"disk","hotplug":false,"children":[{"path":"/dev/sda1","label":"root","fstype":"ext4","mountpoint":"/","rm":false,"size":"1T","type":"part","hotplug":false}]},{"path":"/dev/sdb","label":null,"fstype":null,"mountpoint":null,"rm":true,"size":"32G","type":"disk","hotplug":true,"children":[{"path":"/dev/sdb1","label":"STICK","fstype":"vfat","mountpoint":null,"rm":true,"size":"32G","type":"part","hotplug":true}]},{"path":"/dev/sdc1","label":"","fstype":"swap","mountpoint":null,"rm":false,"size":"8G","type":"part","hotplug":false}]}"#;
