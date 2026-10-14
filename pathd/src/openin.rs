@@ -273,7 +273,10 @@ pub fn open(id_or_role: &str, uris: &[Uri], line: Option<u64>) -> Result<(u32, b
     if running {
         if let Some(reuse) = tool.str_field("reuse") {
             let p = prepare(&tool, uris, line, reuse)?;
-            let mut cmd = if id == "neovim" {
+            // Also migrate the old built-in template stored in existing user configurations.
+            // Explicit custom reuse commands retain their configured behavior.
+            let builtin_neovim = id == "neovim" && matches!(reuse, "nvim-rpc" | "nvim --server {socket} --remote-send '<Esc>:e {file}<CR>:{line}<CR>'");
+            let mut cmd = if builtin_neovim {
                 nvim_reuse(uris, line)?
             } else {
                 let mut cmd = Command::new("sh");
