@@ -6,6 +6,12 @@ name: CI
 # were built from and publishes them. What ships is what CI built and tested, and no commit
 # becomes a release on its own.
 on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'Commit or tag to validate (empty uses the selected branch)'
+        type: string
+        default: ''
   push:
     branches: [main]
     paths-ignore: ['docs/**', '**/*.md']
@@ -36,9 +42,11 @@ jobs:
       - name: Install toolchain
         run: |
           sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf sudo \
-            openssh vsftpd ffmpeg dbus xdg-desktop-portal libpng glib2 gvfs gvfs-smb
+            openssh vsftpd ffmpeg dbus xdg-desktop-portal libpng glib2 gvfs gvfs-smb python neovim
           useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.revision || github.sha }}
       - uses: actions/cache@v6
         with:
           path: |
@@ -81,6 +89,8 @@ jobs:
           sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed make xorg-server-xvfb \
             qt6-base qt6-declarative qt6-svg qt6-multimedia qt6-multimedia-ffmpeg ttf-liberation
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.revision || github.sha }}
       - name: Run qmltestrunner
         run: |
           export QT_QPA_PLATFORM=offscreen
