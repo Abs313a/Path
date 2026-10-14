@@ -5,7 +5,9 @@ use crate::listing::*;
 use std::time::Duration;
 
 fn temp_tree(n: usize) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("path-listing-{}-{}", std::process::id(), n));
+    static NEXT_TREE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT_TREE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("path-listing-{}-{id}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     for i in 0..n {
