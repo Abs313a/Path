@@ -272,10 +272,12 @@ pub fn copy_file(master: &Side, from: &str, replica: &Side, to: &str, bytes: u64
                 tmp.write_all(&chunk)?;
                 (ctx.on_bytes)(chunk.len() as u64);
             }
-            if mtime > 0 {
-                tmp.as_file().set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime)))?;
+            let metadata = source.metadata()?;
+            if let Ok(modified) = metadata.modified() {
+                tmp.as_file().set_times(std::fs::FileTimes::new().set_modified(modified))?;
             }
-            tmp.persist(&dst.path).map_err(|e| VfsError::from(e.error))?;
+            let landed = tmp.persist(&dst.path).map_err(|e| VfsError::from(e.error))?;
+            landed.set_permissions(metadata.permissions())?;
             Ok(())
         }
         (Side::Local(mroot), Side::Remote(s, rroot)) => {

@@ -818,6 +818,7 @@ fn copies_reject_traversal_and_do_not_follow_destination_links() {
     let src = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(src.path().join("source"), b"new data").unwrap();
+    std::fs::set_permissions(src.path().join("source"), std::fs::Permissions::from_mode(0o750)).unwrap();
     let victim = outside.path().join("victim");
     std::fs::write(&victim, b"preserve").unwrap();
     std::os::unix::fs::symlink(&victim, root.path().join("dest")).unwrap();
@@ -832,5 +833,5 @@ fn copies_reject_traversal_and_do_not_follow_destination_links() {
     copy_file(&m, "source", &r, "dest", 8, 0, &ctx).unwrap();
     assert_eq!(std::fs::read(&victim).unwrap(), b"preserve");
     assert_eq!(std::fs::read(root.path().join("dest")).unwrap(), b"new data");
-    assert_eq!(std::fs::metadata(root.path().join("dest")).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(root.path().join("dest")).unwrap().permissions().mode() & 0o777, 0o750);
 }
