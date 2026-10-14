@@ -56,7 +56,8 @@
 ### Fedora 43 and 44 via COPR (x86_64)
 
 Packages are available in [christitustech/copr-fedora](https://copr.fedorainfracloud.org/coprs/christitustech/copr-fedora/).
-On Fedora 43, first enable the Quickshell dependency repository:
+
+On **Fedora 43**, first enable the Quickshell dependency repository:
 
 ```bash
 sudo dnf copr enable errornointernet/quickshell
