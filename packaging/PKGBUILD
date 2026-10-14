@@ -1,7 +1,7 @@
 # Maintainer: David Clark <david.j.clark@icloud.com>
 # Source package: builds path from the repository checkout one level up.
 pkgname=path
-pkgver=0.2.2
+pkgver=0.1.0
 pkgrel=1
 pkgdesc="A light, practical file manager: Rust daemon, Quickshell front end"
 arch=('x86_64' 'aarch64')

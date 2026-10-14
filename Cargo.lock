@@ -1477,11 +1477,11 @@ dependencies = [
 
 [[package]]
 name = "path-json"
-version = "0.2.2"
+version = "0.1.0"
 
 [[package]]
 name = "path-plugin-dbus"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "path-plugin-sdk",
  "tokio",
@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "path-plugin-ftps"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "path-plugin-sdk",
  "ring",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "path-plugin-gio"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "gio",
  "glib",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "path-plugin-sdk"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "log",
  "path-json",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "path-plugin-sftp"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "path-plugin-sdk",
  "rand",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "path-plugin-share-mail"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "path-plugin-sdk",
  "ring",
@@ -1539,14 +1539,14 @@ dependencies = [
 
 [[package]]
 name = "path-plugin-share-tailscale"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "path-plugin-sdk",
 ]
 
 [[package]]
 name = "pathd"
-version = "0.2.2"
+version = "0.1.0"
 dependencies = [
  "image",
  "libc",

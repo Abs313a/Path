@@ -53,13 +53,6 @@
 
 ## Installation
 
-### Automatic Installer (`install.sh`)
-The universal installer detects your distribution package manager (`dnf`, `pacman`) or compiles from source:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ChrisTitusTech/Path/main/install.sh | bash
-```
-
 ### Building from Source (`Makefile`)
 Standard build and installation with GNU Make:
 

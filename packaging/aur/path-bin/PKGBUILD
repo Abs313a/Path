@@ -1,10 +1,8 @@
 # Maintainer: David Clark <david.j.clark@icloud.com>
-# Repackages the release build from GitHub. NOT published: the AUR was not taking new accounts
-# when 0.1.0 shipped, so the release workflow no longer pushes it; `install.sh` at the repository
-# root is how path is installed. Kept for the day the AUR is an option again.
+# Repackages the GitHub release. Not published to the AUR.
 pkgname=path-bin
 _pkgname=path
-pkgver=0.2.2
+pkgver=0.1.0
 pkgrel=1
 pkgdesc="A light, practical file manager: Rust daemon, Quickshell front end (binary release)"
 arch=('x86_64' 'aarch64')

@@ -56,8 +56,8 @@ jobs:
       - name: makepkg
         # `--nocheck`: the PKGBUILD's check() is the whole test suite again in release profile,
         # and it has just run above on this commit. Building by hand still runs it.
-        # `PKGEXT`: Arch Linux ARM's makepkg.conf says `.pkg.tar.xz`; the installer and the
-        # release name the file with `.zst` on both architectures, so this does too.
+        # `PKGEXT`: Arch Linux ARM's makepkg.conf says `.pkg.tar.xz`; the
+        # release names the file with `.zst` on both architectures, so this does too.
         run: |
           sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" PKGEXT=.pkg.tar.zst bash -c 'cd packaging && makepkg -f --nodeps --noconfirm --nocheck'
           cd packaging && ls -l && sha256sum path-*.pkg.tar.zst > "$(ls path-*.pkg.tar.zst).sha256" && ls -l path-*

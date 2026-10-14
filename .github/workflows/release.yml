@@ -142,8 +142,11 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            Install or upgrade on Arch / Omarchy:
+            Install or upgrade on Arch / Omarchy by downloading the package for your
+            architecture below and running `sudo pacman -U <package>`.
 
-                curl -fsSL https://raw.githubusercontent.com/ChrisTitusTech/Path/main/install.sh | bash
+            Source build instructions: https://github.com/ChrisTitusTech/Path#installation
 
-            Or download the package for your architecture below and `sudo pacman -U` it.
+            Public COPR distribution remains on hold. Fedora 43 installation validation
+            is blocked by the unavailable Quickshell dependency. See the security review
+            in docs/security-review-2026-10-14.md for remaining dependency advisories.

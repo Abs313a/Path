@@ -33,7 +33,6 @@ REQUIRED_TEXT = {
         'members = ["pathd",',
         'repository = "https://github.com/ChrisTitusTech/Path"',
     ),
-    "install.sh": ('repo="ChrisTitusTech/Path"', "PATHFM_VERSION", "PATHFM_PACKAGE"),
     "packaging/PKGBUILD": ("pkgname=path", 'url="https://github.com/ChrisTitusTech/Path"'),
     "packaging/pathfm.desktop": (
         "Name=Path",
