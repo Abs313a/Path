@@ -144,6 +144,6 @@ jobs:
           body: |
             Install or upgrade on Arch / Omarchy:
 
-                curl -fsSL https://raw.githubusercontent.com/Abs313a/Path/main/install.sh | bash
+                curl -fsSL https://raw.githubusercontent.com/ChrisTitusTech/Path/main/install.sh | bash
 
             Or download the package for your architecture below and `sudo pacman -U` it.

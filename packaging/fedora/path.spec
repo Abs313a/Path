@@ -8,7 +8,7 @@ Version:        0.2.2
 Release:        0.2%{?dist}
 Summary:        Light, practical file manager with a Quickshell interface
 License:        ((MIT OR Apache-2.0) AND Unicode-3.0) AND (0BSD OR MIT OR Apache-2.0) AND Apache-2.0 AND (Apache-2.0 AND ISC) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND BSD-3-Clause AND (BSD-3-Clause OR Apache-2.0) AND CDLA-Permissive-2.0 AND ISC AND MIT AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND (Unlicense OR MIT) AND Zlib AND (Zlib OR Apache-2.0 OR MIT)
-URL:            https://github.com/Abs313a/Path
+URL:            https://github.com/ChrisTitusTech/Path
 Source0:        path-%{version}.tar.gz
 Source1:        path-%{version}-vendor.tar.gz
 Source2:        bundled-rust-provides.inc

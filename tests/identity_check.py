@@ -31,10 +31,10 @@ REQUIRED_TEXT = {
     "packaging/fedora/path.spec": ("python3 tests/branding_check.py", "python3 tests/packaging_hooks_check.py"),
     "Cargo.toml": (
         'members = ["pathd",',
-        'repository = "https://github.com/Abs313a/Path"',
+        'repository = "https://github.com/ChrisTitusTech/Path"',
     ),
-    "install.sh": ('repo="Abs313a/Path"', "PATHFM_VERSION", "PATHFM_PACKAGE"),
-    "packaging/PKGBUILD": ("pkgname=path", 'url="https://github.com/Abs313a/Path"'),
+    "install.sh": ('repo="ChrisTitusTech/Path"', "PATHFM_VERSION", "PATHFM_PACKAGE"),
+    "packaging/PKGBUILD": ("pkgname=path", 'url="https://github.com/ChrisTitusTech/Path"'),
     "packaging/pathfm.desktop": (
         "Name=Path",
         "Exec=pathfm %U",
@@ -61,7 +61,7 @@ REQUIRED_TEXT = {
     "qml/path/ui/IntegrationDialog.qml": ('"Make Path the default"',),
     "tests/e2e/flows/launcher.py": ('os.path.join(HERE, "packaging", "bin", "pathfm")',),
     ".github/workflows/ci.yml": ("path-package-${{ matrix.arch }}",),
-    ".github/workflows/release.yml": ("path-package-*", "Abs313a/Path"),
+    ".github/workflows/release.yml": ("path-package-*", "ChrisTitusTech/Path"),
 }
 
 DISPLAY_KEYS = (

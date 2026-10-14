@@ -5,7 +5,7 @@ pkgver=0.2.2
 pkgrel=1
 pkgdesc="A light, practical file manager: Rust daemon, Quickshell front end"
 arch=('x86_64' 'aarch64')
-url="https://github.com/Abs313a/Path"
+url="https://github.com/ChrisTitusTech/Path"
 license=('MIT')
 depends=('quickshell' 'xdg-desktop-portal' 'ffmpeg' 'gnome-keyring' 'libsecret' 'libarchive'
          'udisks2' 'git' 'qt6-declarative' 'qt6-multimedia' 'poppler' 'glib2' 'gvfs')

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs Path from the latest GitHub release or local package:
 #
-#   curl -fsSL https://raw.githubusercontent.com/Abs313a/Path/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ChrisTitusTech/Path/main/install.sh | bash
 #
 # It downloads the package built for this machine's architecture, verifies sha256,
 # and installs via the native package manager (pacman or dnf/rpm).
@@ -11,7 +11,7 @@
 #   PATHFM_PACKAGE=/path/to/pkg ...       install a package already on disk (.rpm or .pkg.tar.zst)
 set -euo pipefail
 
-repo="Abs313a/Path"
+repo="ChrisTitusTech/Path"
 api="https://api.github.com/repos/${repo}/releases"
 
 say() { printf ':: %s\n' "$*"; }

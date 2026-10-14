@@ -6,7 +6,7 @@ members = ["pathd", "crates/path-json", "crates/path-plugin-sdk", "plugins/path-
 version = "0.2.2"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Abs313a/Path"
+repository = "https://github.com/ChrisTitusTech/Path"
 
 [profile.release]
 opt-level = 3

@@ -57,7 +57,7 @@
 The universal installer detects your distribution package manager (`dnf`, `pacman`) or compiles from source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Abs313a/Path/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ChrisTitusTech/Path/main/install.sh | bash
 ```
 
 ### Building from Source (`Makefile`)
