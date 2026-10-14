@@ -1,11 +1,11 @@
-# Development RPM for Fedora 44; not a published release or Fedora submission.
+# Development RPM for Fedora 43 and 44; not a published release or Fedora submission.
 # Source0 is a snapshot of the reviewed Path tree, Source1 is cargo vendor --locked.
 # The bundled-license expression and Provides are checked against the offline Cargo graph.
 %global debug_package %{nil}
 
 Name:           path
 Version:        0.2.2
-Release:        0.2%{?dist}
+Release:        0.3%{?path_commit:.git%{path_commit}}%{?dist}
 Summary:        Light, practical file manager with a Quickshell interface
 License:        ((MIT OR Apache-2.0) AND Unicode-3.0) AND (0BSD OR MIT OR Apache-2.0) AND Apache-2.0 AND (Apache-2.0 AND ISC) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND BSD-3-Clause AND (BSD-3-Clause OR Apache-2.0) AND CDLA-Permissive-2.0 AND ISC AND MIT AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND (Unlicense OR MIT) AND Zlib AND (Zlib OR Apache-2.0 OR MIT)
 URL:            https://github.com/ChrisTitusTech/Path
@@ -23,6 +23,10 @@ BuildRequires:  pkgconfig(glib-2.0)
 BuildRequires:  python3
 BuildRequires:  desktop-file-utils
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  bsdtar
+BuildRequires:  git
+BuildRequires:  openssh-clients
+BuildRequires:  neovim
 
 Requires:       quickshell
 Requires:       qt6-qtdeclarative
@@ -34,6 +38,8 @@ Requires:       libsecret
 Requires:       bsdtar
 Requires:       udisks2
 Requires:       git
+Requires:       xclip
+Requires:       xdotool
 Requires:       poppler-utils
 Requires:       gvfs
 Requires:       /usr/bin/ffmpeg
@@ -110,7 +116,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/pathfm.desktop
 
 %files
 %license LICENSE target/license-bundle
-%doc README.md
+%doc README.md SOURCE-COMMIT
 %{_bindir}/pathd
 %{_bindir}/pathfm
 /usr/lib/path/

@@ -34,7 +34,7 @@ class FedoraPackaging(unittest.TestCase):
         text = self.spec()
         for package in ("quickshell", "qt6-qtdeclarative", "qt6-qtmultimedia",
                         "xdg-desktop-portal", "xdg-desktop-portal-gtk", "libsecret",
-                        "gnome-keyring", "bsdtar", "udisks2", "poppler-utils", "gvfs"):
+                        "gnome-keyring", "bsdtar", "udisks2", "poppler-utils", "gvfs", "xclip", "xdotool"):
             self.assertRegex(text, rf"(?m)^Requires:\s+{re.escape(package)}(?:\s|$)")
         for tool in ("ffmpeg", "ffprobe"):
             self.assertRegex(text, rf"(?m)^Requires:\s+/usr/bin/{tool}$")

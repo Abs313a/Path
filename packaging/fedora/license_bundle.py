@@ -8,6 +8,8 @@ import re
 import shutil
 
 SUPPLEMENTS = {
+    ("russh-cryptovec", "0.62.0"): ("907c732562c5732aad6c140dba958eafddc41ba0", "russh-cryptovec-0.62.0"),
+    ("russh", "0.64.1"): ("e5d80a07dc554480b6ea3b2e14adfc190407b627", "russh-0.64.1"),
     ("delegate", "0.13.5"): ("b129d4cbf4cc499eff7743365dcb0fe5d8d2e820", "delegate"),
     ("lazy-regex-proc_macros", "3.6.1"): ("39a459c01e1ba2488075be50a821e2d72e466241", "lazy-regex"),
     ("russh", "0.52.1"): ("5e913966780dc226f52367be1a6666ddfcee81dc", "russh-0.52.1"),
