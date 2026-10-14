@@ -27,7 +27,10 @@ def main():
     actual = run('git', 'rev-parse', f'{args.commit}^{{commit}}', capture_output=True, text=True).stdout.strip()
     if actual != args.commit:
         parser.error('commit does not resolve exactly')
-    spec = args.spec.resolve().relative_to(ROOT) if args.spec.is_absolute() else args.spec
+    try:
+        spec = args.spec.resolve().relative_to(ROOT)
+    except ValueError:
+        parser.error('spec must be inside the repository')
     if '..' in spec.parts:
         parser.error('spec must be inside the repository')
     out = args.outdir.resolve()

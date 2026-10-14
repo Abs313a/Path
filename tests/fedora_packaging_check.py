@@ -75,7 +75,7 @@ class FedoraPackaging(unittest.TestCase):
             sentinel = home / "mimeapps.list"
             sentinel.write_text("preserve my defaults\n")
             macros = {"buildroot": str(stage), "_bindir": "/usr/bin", "_datadir": "/usr/share",
-                      "_userunitdir": "/usr/lib/systemd/user", "version": "0.2.2"}
+                      "_userunitdir": "/usr/lib/systemd/user", "version": tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]}
             for key, value in macros.items():
                 script = script.replace("%{" + key + "}", value)
             self.assertNotIn("%{", script, "unexpanded install macro")
@@ -94,7 +94,7 @@ class FedoraPackaging(unittest.TestCase):
             ):
                 self.assertEqual((ROOT / asset).read_bytes(), (stage / installed).read_bytes())
             socket = (stage / "usr/lib/systemd/user/pathfm.socket").read_text()
-            self.assertIn("ListenStream=%t/pathfm-0.2.2.sock", socket)
+            self.assertIn(f"ListenStream=%t/pathfm-{macros["version"]}.sock", socket)
             self.assertNotIn("@VERSION@", socket)
             self.assertTrue((stage / "usr/share/path/shell.qml").is_file())
             self.assertTrue((stage / "usr/share/xdg-desktop-portal/portals/path.portal").is_file())
