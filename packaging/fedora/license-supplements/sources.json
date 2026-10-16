@@ -34,5 +34,17 @@
   {
     "file": "russh-cryptovec-0.62.0/LICENSE.txt",
     "url": "https://raw.githubusercontent.com/warp-tech/russh/907c732562c5732aad6c140dba958eafddc41ba0/LICENSE.txt"
+  },
+  {
+    "file": "docx-rs-0.4.22/LICENSE",
+    "url": "https://raw.githubusercontent.com/bokuweb/docx-rs/f04cf8b47a925b2b6fff850dcb75069aae89dab4/LICENSE"
+  },
+  {
+    "file": "rquickjs-0.13.0/LICENSE",
+    "url": "https://raw.githubusercontent.com/DelSkayn/rquickjs/f3039c8d931417049ce6133b3ff4550ca38438a5/LICENSE"
+  },
+  {
+    "file": "rust-i18n-4.2.4/LICENSE",
+    "url": "https://raw.githubusercontent.com/longbridge/rust-i18n/5f3ea5ba03395f2f2908e3587e01788cfdfd3555/LICENSE"
   }
 ]

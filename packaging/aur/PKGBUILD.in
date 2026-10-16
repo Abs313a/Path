@@ -1,0 +1,76 @@
+# Maintainer: Path maintainers <https://github.com/ChrisTitusTech/Path/issues>
+# Generated from PKGBUILD.in; do not edit directly.
+
+pkgname=@PKGNAME@
+pkgver=@PKGVER@
+pkgrel=@PKGREL@
+_releasever=@RELEASEVER@
+pkgdesc="@PKGDESC@"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ChrisTitusTech/Path"
+license=('MIT' 'LicenseRef-UnRAR')
+depends=(
+  'bubblewrap'
+  'fontconfig'
+  'glibc>=2.39'
+  'gstreamer>=1.20'
+  'gst-plugins-base'
+  'gtk4>=4.12'
+  'gtksourceview5'
+  'gvfs'
+  'poppler-glib'
+)
+optdepends=(
+  'ffmpeg: video previews'
+  'ffmpegthumbnailer: video thumbnails'
+  'gst-libav: additional media format playback'
+  'gst-plugins-good: media playback in previews'
+  'gvfs-smb: SMB network locations'
+  'imagemagick: RAW image previews'
+  'libraw: RAW image previews when ImageMagick is unavailable'
+  'squashfs-tools: AppImage icon thumbnails'
+  'xdg-terminal-exec: preferred Open in Terminal launcher (AUR)'
+)
+provides=("pathfm=${pkgver}")
+conflicts=('pathfm' '@ALTERNATE@')
+# Preserve byte identity with the attested release artifact.
+options=('!strip' '!debug')
+source_x86_64=("${url}/releases/download/v${_releasever}/pathfm-${_releasever}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("${url}/releases/download/v${_releasever}/pathfm-${_releasever}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  local dist="${srcdir}/pathfm-${_releasever}-${CARCH}-unknown-linux-gnu"
+
+  install -Dm755 "${dist}/pathfm" "${pkgdir}/usr/bin/pathfm"
+  install -Dm644 "${dist}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  # Older release archives predate bundled UnRAR.
+  if [[ -f "${dist}/UnRAR.txt" ]]; then
+    install -Dm644 "${dist}/UnRAR.txt" "${pkgdir}/usr/share/licenses/${pkgname}/UnRAR.txt"
+  fi
+  install -Dm644 "${dist}/THIRD_PARTY_LICENSES.md" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES.md"
+
+  if [[ -f "${dist}/pathfm.desktop" ]]; then
+    install -Dm644 "${dist}/pathfm.desktop" \
+      "${pkgdir}/usr/share/applications/pathfm.desktop"
+    install -Dm644 "${dist}/io.github.christitustech.Path.png" \
+      "${pkgdir}/usr/share/icons/hicolor/512x512/apps/io.github.christitustech.Path.png"
+  else
+    warning "Path ${_releasever} ships no desktop entry or application icon; installing without a launcher."
+  fi
+
+  if [[ -f "${dist}/io.github.christitustech.Path.FileManager1.service" ]]; then
+    install -Dm644 "${dist}/io.github.christitustech.Path.FileManager1.service" \
+      "${pkgdir}/usr/share/pathfm/io.github.christitustech.Path.FileManager1.service"
+  fi
+
+  install -Dm644 /dev/stdin "${pkgdir}/usr/share/pathfm/install-source.toml" <<'MARKER'
+manager = "pacman"
+package = "@PKGNAME@"
+channel = "@CHANNEL@"
+aur_helpers = ["yay", "paru", "pikaur", "trizen"]
+alternate_package = "@ALTERNATE@"
+MARKER
+}

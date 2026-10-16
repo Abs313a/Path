@@ -1,0 +1,14 @@
+-- pathfm-installer: file-manager start
+hl.unbind("SUPER + SHIFT + F")
+hl.unbind("SUPER + ALT + SHIFT + F")
+o.bind("SUPER + SHIFT + F", "File manager", { launch = "$BIN_PATH" })
+o.bind("SUPER + ALT + SHIFT + F", "File manager (cwd)",
+  "uwsm-app -- $BIN_PATH \"\$(distro-cmd-terminal-cwd)\"")
+-- pathfm-installer: file-manager end
+
+# pathfm-installer: file-manager start
+unbind = SUPER SHIFT, F
+unbind = SUPER ALT SHIFT, F
+bindd = SUPER SHIFT, F, File manager, exec, uwsm-app -- $BIN_PATH
+bindd = SUPER ALT SHIFT, F, File manager (cwd), exec, uwsm-app -- $BIN_PATH "\$(distro-cmd-terminal-cwd)"
+# pathfm-installer: file-manager end

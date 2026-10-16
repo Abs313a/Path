@@ -1,0 +1,897 @@
+// SPDX-License-Identifier: MIT
+
+//! Staged archive publication and the existing format-specific writers.
+
+#[cfg(test)]
+mod tests;
+
+use super::super::{
+    local_directory_children, open_local_child_directory, open_local_parent_directory,
+};
+use super::{
+    ArchiveError, COPY_BUF, archive_failed, check_archive_cancelled, copy_with_big_buf,
+    decoders::FILE_ATTRIBUTE_UNIX_EXTENSION, destination::process_umask,
+};
+use crate::services::{TransferConflict, TrashedOriginal};
+use gtk::{gio, glib, prelude::*};
+use std::{
+    ffi::{OsStr, OsString},
+    io::{self, Read, Seek, SeekFrom, Write},
+    os::{
+        fd::AsFd,
+        unix::{ffi::OsStringExt, fs::PermissionsExt},
+    },
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+/// Writes an archive through a staging file, then publishes it at `archive_path`.
+///
+/// Creates a `.pathfm-compression-` tempfile in `destination` with mode `0o600`,
+/// runs `write_archive` on a worker thread, applies the published permissions,
+/// and persists the file according to `conflict`, returning the published filename
+/// and the identity of any original preserved in Trash for undo.
+/// [`FailIfExists`] refuses to replace an existing archive; [`KeepBoth`] tries numbered names atomically
+/// without encoding again; [`ReplaceExisting`] trashes the original and copies
+/// the current destination file's mode when that path is already a regular
+/// file. Otherwise the published mode is `0o666` masked by the process umask.
+///
+/// # Arguments
+///
+/// * `destination` - Directory that holds both the staging file and the final archive
+/// * `archive_path` - Final path to publish once encoding succeeds
+/// * `conflict` - Whether an existing archive may be replaced
+/// * `cancelled` - Flag checked after encoding and before persist
+/// * `write_archive` - Encoder that writes the archive body into the staging file
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set after encoding finishes
+/// - [`Failed`] if staging, encoding, permission updates, or persist fail, including
+///   when the compression task panics
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+/// [`FailIfExists`]: TransferConflict::FailIfExists
+/// [`ReplaceExisting`]: TransferConflict::ReplaceExisting
+/// [`KeepBoth`]: TransferConflict::KeepBoth
+pub(super) async fn write_staged_archive<F>(
+    destination: &Path,
+    archive_path: &Path,
+    conflict: TransferConflict,
+    cancelled: &AtomicBool,
+    write_archive: F,
+) -> Result<(String, Option<TrashedOriginal>), ArchiveError>
+where
+    F: FnOnce(std::fs::File) -> Result<(), ArchiveError> + Send + 'static,
+{
+    let requested_name = archive_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| crate::i18n::tr("Archive filename must be UTF-8"))?;
+    let published_permissions = if conflict == TransferConflict::ReplaceExisting {
+        match std::fs::symlink_metadata(archive_path) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata.permissions()),
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(archive_creation_failed(destination, &error)),
+        }
+    } else {
+        None
+    }
+    .unwrap_or_else(umask_adjusted_file_permissions);
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix(".pathfm-compression-")
+        .permissions(std::fs::Permissions::from_mode(0o600));
+    let mut staged = builder
+        .tempfile_in(destination)
+        .map_err(|error| archive_creation_failed(destination, &error))?;
+    let file = staged
+        .reopen()
+        .map_err(|error| archive_creation_failed(destination, &error))?;
+    gio::spawn_blocking(move || write_archive(file))
+        .await
+        .map_err(|_| archive_failed(crate::i18n::tr("Compression stopped unexpectedly")))??;
+    // The non-Send LoadHandle cancels on this same main context. Keep the
+    // final cancellation check and publication synchronous, without yielding.
+    check_archive_cancelled(cancelled)?;
+    staged
+        .as_file()
+        .set_permissions(published_permissions)
+        .map_err(|error| archive_creation_failed(destination, &error))?;
+    if conflict != TransferConflict::KeepBoth {
+        let original = if conflict == TransferConflict::ReplaceExisting {
+            match std::fs::symlink_metadata(archive_path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(archive_failed(crate::i18n::tr(
+                        "An archive cannot replace a folder",
+                    )));
+                }
+                Ok(metadata) => {
+                    gio::File::for_path(archive_path)
+                        .trash(None::<&gio::Cancellable>)
+                        .map_err(|error| {
+                            archive_failed(rust_i18n::t!(
+                                "Could not move %{name} to Trash: %{error}",
+                                name = requested_name,
+                                error = crate::services::gio_error_detail(&error)
+                            ))
+                        })?;
+                    Some(TrashedOriginal::from_metadata(&metadata))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(archive_creation_failed(destination, &error)),
+            }
+        } else {
+            None
+        };
+        return staged
+            .persist_noclobber(archive_path)
+            .map(|_| (requested_name.to_owned(), original))
+            .map_err(|error| {
+                if original.is_some() {
+                    archive_failed(rust_i18n::t!(
+                        "Could not publish the archive; the original is in Trash: %{error}",
+                        error = crate::services::io_error_detail(&error.error)
+                    ))
+                } else {
+                    archive_creation_failed(destination, &error.error)
+                }
+            });
+    }
+
+    let (stem, extension) = requested_name
+        .strip_suffix(".tar.gz")
+        .map(|stem| (stem, "tar.gz"))
+        .or_else(|| requested_name.rsplit_once('.'))
+        .ok_or_else(|| crate::i18n::tr("Archive filename must have a format extension"))?;
+    let mut candidate_name = requested_name.to_owned();
+    for suffix in 1_u64.. {
+        let candidate = archive_path.with_file_name(&candidate_name);
+        match staged.persist_noclobber(&candidate) {
+            Ok(_) => return Ok((candidate_name, None)),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                staged = error.file;
+                candidate_name = format!("{stem} ({suffix}).{extension}");
+            }
+            Err(error) => return Err(archive_creation_failed(destination, &error.error)),
+        }
+    }
+    Err(archive_failed(crate::i18n::tr(
+        "No available archive filename",
+    )))
+}
+
+fn archive_creation_failed(destination: &Path, error: &io::Error) -> ArchiveError {
+    archive_failed(rust_i18n::t!(
+        "Could not create the archive in %{folder}: %{error}",
+        folder = destination.display(),
+        error = crate::services::io_error_detail(error)
+    ))
+}
+
+fn io_text(error: &io::Error) -> String {
+    crate::services::io_error_message(error)
+}
+
+fn errno_text(error: rustix::io::Errno) -> String {
+    io_text(&error.into())
+}
+
+fn zip_text(error: zip::result::ZipError) -> String {
+    match error {
+        zip::result::ZipError::Io(error) => io_text(&error),
+        error => encoder_failure(&error),
+    }
+}
+
+fn sevenz_text(error: sevenz_rust2::Error) -> String {
+    match error {
+        sevenz_rust2::Error::Io(error, _) | sevenz_rust2::Error::FileOpen(error, _) => {
+            io_text(&error)
+        }
+        error => encoder_failure(&error),
+    }
+}
+
+/// Encoder diagnostics are untranslated library text, so they are only logged.
+fn encoder_failure(error: &dyn std::fmt::Display) -> String {
+    tracing::warn!(%error, "archive encoder failed");
+    crate::i18n::tr("The archive could not be written")
+}
+
+/// Returns `0o666` masked by the process umask from [`process_umask`].
+fn umask_adjusted_file_permissions() -> std::fs::Permissions {
+    std::fs::Permissions::from_mode(0o666 & !process_umask())
+}
+
+/// An opened compression source, re-read from disk relative to its parent
+/// directory rather than trusted from any earlier listing.
+enum ArchiveSource {
+    /// Open file description for a regular file, opened with `BENEATH`,
+    /// `NO_SYMLINKS`, and `NO_MAGICLINKS`.
+    File(std::fs::File),
+    /// Open directory used to walk children descriptor-relative.
+    Directory(std::fs::File),
+    Symlink {
+        target: PathBuf,
+        modified: Option<SystemTime>,
+    },
+}
+
+fn source_metadata(source: &ArchiveSource) -> Result<(Option<SystemTime>, Option<u32>), String> {
+    match source {
+        ArchiveSource::File(file) | ArchiveSource::Directory(file) => {
+            let metadata = file.metadata().map_err(|error| io_text(&error))?;
+            Ok((
+                metadata.modified().ok(),
+                Some(metadata.permissions().mode()),
+            ))
+        }
+        ArchiveSource::Symlink { modified, .. } => Ok((*modified, None)),
+    }
+}
+
+fn unix_seconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since_epoch| since_epoch.as_secs())
+}
+
+/// DOS timestamps use local time and can only represent 1980–2107.
+fn zip_datetime(modified: Option<SystemTime>) -> zip::DateTime {
+    let Some(local) = modified
+        .and_then(unix_seconds)
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .and_then(|seconds| glib::DateTime::from_unix_local(seconds).ok())
+    else {
+        return zip::DateTime::DEFAULT;
+    };
+    let part = |value: i32| u8::try_from(value).unwrap_or_default();
+    match u16::try_from(local.year()).unwrap_or_default() {
+        ..1980 => zip::DateTime::DEFAULT,
+        2108.. => zip::DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58)
+            .unwrap_or(zip::DateTime::DEFAULT),
+        year => zip::DateTime::from_date_and_time(
+            year,
+            part(local.month()),
+            part(local.day_of_month()),
+            part(local.hour()),
+            part(local.minute()),
+            part(local.second()),
+        )
+        .unwrap_or(zip::DateTime::DEFAULT),
+    }
+}
+
+fn zip_member_options<'k>(
+    base: zip::write::FileOptions<'k, ()>,
+    modified: Option<SystemTime>,
+    mode: Option<u32>,
+) -> Result<zip::write::FullFileOptions<'k>, String> {
+    let mut options = base
+        .last_modified_time(zip_datetime(modified))
+        .into_full_options();
+    if let Some(mode) = mode {
+        options = options.unix_permissions(mode);
+    }
+    if let Some(seconds) = modified
+        .and_then(unix_seconds)
+        .and_then(|seconds| i32::try_from(seconds).ok())
+    {
+        // Flags byte 1: only the modification time follows.
+        let mut field = vec![1];
+        field.extend_from_slice(&seconds.to_le_bytes());
+        options
+            .add_extra_data(0x5455, field, false)
+            .map_err(zip_text)?;
+    }
+    Ok(options)
+}
+
+/// Opens the child named `name` inside `parent` without following symbolic links.
+///
+/// Regular files are opened with [`rustix::fs::ResolveFlags::BENEATH`],
+/// [`rustix::fs::ResolveFlags::NO_SYMLINKS`], and
+/// [`rustix::fs::ResolveFlags::NO_MAGICLINKS`]. Directories go through
+/// [`open_local_child_directory`]. Symlinks are read with `readlinkat` and
+/// stored as [`ArchiveSource::Symlink`].
+///
+/// # Errors
+///
+/// Returns an error if `name` cannot be inspected, is an unsupported file
+/// type, or changes from a regular file between `statat` and `openat2`.
+fn open_archive_source<Fd: AsFd>(parent: &Fd, name: &OsStr) -> Result<ArchiveSource, String> {
+    let stat = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(errno_text)?;
+    match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+        rustix::fs::FileType::Symlink => {
+            let target = rustix::fs::readlinkat(parent, name, Vec::new()).map_err(errno_text)?;
+            let modified = u64::try_from(stat.st_mtime)
+                .ok()
+                .zip(u32::try_from(stat.st_mtime_nsec).ok())
+                .and_then(|(seconds, nanos)| UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)));
+            Ok(ArchiveSource::Symlink {
+                target: PathBuf::from(OsString::from_vec(target.into_bytes())),
+                modified,
+            })
+        }
+        rustix::fs::FileType::Directory => open_local_child_directory(parent, name)
+            .map(std::fs::File::from)
+            .map(ArchiveSource::Directory),
+        rustix::fs::FileType::RegularFile => {
+            let file = rustix::fs::openat2(
+                parent,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+                rustix::fs::ResolveFlags::BENEATH
+                    | rustix::fs::ResolveFlags::NO_SYMLINKS
+                    | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+            )
+            .map(std::fs::File::from)
+            .map_err(errno_text)?;
+            if !file.metadata().map_err(|error| io_text(&error))?.is_file() {
+                return Err(crate::i18n::tr("The file type changed during compression"));
+            }
+            Ok(ArchiveSource::File(file))
+        }
+        _ => Err(crate::i18n::tr(
+            "Compression supports only regular files, folders, and symbolic links",
+        )),
+    }
+}
+
+/// Walks each path in `entries` and its descendants, calling `visit` per member.
+///
+/// Selected roots are opened from their parent directory via
+/// [`open_local_parent_directory`], then recursion stays descriptor-relative
+/// through [`visit_archive_entry`].
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set before or during the walk
+/// - [`Failed`] if a root has no file name or parent, cannot be opened, or
+///   `visit` fails
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+fn visit_archive_entries(
+    entries: &[PathBuf],
+    cancelled: &AtomicBool,
+    visit: &mut impl FnMut(&Path, &ArchiveSource) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
+    for entry in entries {
+        check_archive_cancelled(cancelled)?;
+        let name = entry
+            .file_name()
+            .ok_or_else(|| crate::i18n::tr("Cannot compress the filesystem root"))?;
+        let parent = open_local_parent_directory(
+            entry
+                .parent()
+                .ok_or_else(|| crate::i18n::tr("Cannot compress the filesystem root"))?,
+        )?;
+        visit_archive_entry(&parent, name, Path::new(name), cancelled, visit)?;
+    }
+    Ok(())
+}
+
+/// Visits `name` inside `parent` and, for directories, each child beneath it.
+///
+/// `archive_path` is the member path written into the archive, rooted at the
+/// originally selected entry's file name.
+///
+/// # Arguments
+///
+/// * `parent` - Already-open parent directory of `name`
+/// * `name` - Directory entry to open without following symbolic links
+/// * `archive_path` - Relative path recorded for this member
+/// * `cancelled` - Flag checked before opening and before each child
+/// * `visit` - Callback invoked with the archive path and opened source
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set
+/// - [`Failed`] if the entry cannot be opened or `visit` fails
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+fn visit_archive_entry<Fd: AsFd>(
+    parent: &Fd,
+    name: &OsStr,
+    archive_path: &Path,
+    cancelled: &AtomicBool,
+    visit: &mut impl FnMut(&Path, &ArchiveSource) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
+    check_archive_cancelled(cancelled)?;
+    let source = open_archive_source(parent, name).map_err(|error| {
+        archive_failed(rust_i18n::t!(
+            "Could not compress “%{path}”: %{error}",
+            path = archive_path.display(),
+            error = crate::services::error_detail(error)
+        ))
+    })?;
+    visit(archive_path, &source)?;
+    if let ArchiveSource::Directory(directory) = source {
+        for child in local_directory_children(&directory)? {
+            visit_archive_entry(
+                &directory,
+                &child,
+                &archive_path.join(&child),
+                cancelled,
+                visit,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+struct CompressionIo<'a, T> {
+    inner: T,
+    cancelled: &'a AtomicBool,
+}
+
+impl<'a, T> CompressionIo<'a, T> {
+    fn new(inner: T, cancelled: &'a AtomicBool) -> Self {
+        Self { inner, cancelled }
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err(io::Error::other("Archive operation cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<T: Read> Read for CompressionIo<'_, T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.read(buffer)
+    }
+}
+
+impl<T: Write> Write for CompressionIo<'_, T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
+
+impl<T: Seek> Seek for CompressionIo<'_, T> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.check()?;
+        self.inner.seek(position)
+    }
+}
+
+fn compression_result(
+    cancelled: &AtomicBool,
+    encode: impl FnOnce() -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
+    check_archive_cancelled(cancelled)?;
+    let result = encode();
+    // Encoders wrap I/O errors in their own types; cancellation remains a
+    // terminal cancellation event rather than a password/error retry.
+    check_archive_cancelled(cancelled)?;
+    result
+}
+
+/// Writes a ZIP archive of `entries` into `file`.
+///
+/// Regular files use deflate level 6 unless [`is_incompressible`] selects
+/// stored. An optional `password` enables AES-256 encryption. Symbolic-link
+/// targets must be UTF-8; otherwise the caller is asked to use TAR instead.
+///
+/// # Arguments
+///
+/// * `file` - Staging file that receives the ZIP bytes
+/// * `entries` - Absolute paths of selected files, directories, and links
+/// * `password` - Optional AES-256 password
+/// * `progress` - Counter incremented once per non-directory member
+/// * `cancelled` - Flag checked between members and during copies
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set during the walk or copy
+/// - [`Failed`] if a member cannot be opened, a symlink target is not UTF-8,
+///   or ZIP encoding fails
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+pub(super) fn compress_zip(
+    file: impl Write + Seek,
+    entries: &[std::path::PathBuf],
+    password: Option<&str>,
+    progress: &Arc<AtomicUsize>,
+    cancelled: &AtomicBool,
+) -> Result<(), ArchiveError> {
+    compression_result(cancelled, || {
+        let writer =
+            std::io::BufWriter::with_capacity(COPY_BUF, CompressionIo::new(file, cancelled));
+        let mut writer = zip::ZipWriter::new(writer);
+        let deflated = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(6));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let deflated = if let Some(pw) = password {
+            deflated.with_aes_encryption(zip::AesMode::Aes256, pw)
+        } else {
+            deflated
+        };
+        let stored = if let Some(pw) = password {
+            stored.with_aes_encryption(zip::AesMode::Aes256, pw)
+        } else {
+            stored
+        };
+        visit_archive_entries(entries, cancelled, &mut |path, source| {
+            let name = path.to_str().ok_or_else(|| {
+                rust_i18n::t!(
+                    "ZIP cannot preserve the non-UTF-8 name of %{path}. Use TAR instead.",
+                    path = path.display()
+                )
+                .into_owned()
+            })?;
+            let (modified, mode) = source_metadata(source)?;
+            match source {
+                ArchiveSource::Directory(_) => {
+                    return writer
+                        .add_directory(name, zip_member_options(stored, modified, mode)?)
+                        .map_err(|error| archive_failed(zip_text(error)));
+                }
+                ArchiveSource::Symlink { target, .. } => {
+                    let target = target.to_str().ok_or_else(|| {
+                        rust_i18n::t!(
+                            "ZIP cannot preserve the non-UTF-8 link target of %{path}. Use TAR instead.",
+                            path = path.display()
+                        )
+                        .into_owned()
+                    })?;
+                    writer
+                        .add_symlink(name, target, zip_member_options(stored, modified, None)?)
+                        .map_err(zip_text)?;
+                }
+                ArchiveSource::File(file) => {
+                    let base = if is_incompressible(path) {
+                        stored
+                    } else {
+                        deflated
+                    };
+                    writer
+                        .start_file(name, zip_member_options(base, modified, mode)?)
+                        .map_err(zip_text)?;
+                    copy_with_big_buf(
+                        std::io::BufReader::with_capacity(COPY_BUF, file),
+                        &mut writer,
+                        cancelled,
+                    )?;
+                }
+            }
+            progress.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })?;
+        check_archive_cancelled(cancelled)?;
+        writer
+            .finish()
+            .map_err(zip_text)?
+            .into_inner()
+            .map_err(|error| io_text(error.error()))?;
+        Ok(())
+    })
+}
+
+/// Writes a TAR archive of `entries` into `file`.
+///
+/// When `gzip` is set, the TAR stream is wrapped in one gzip member at that level.
+/// Symbolic links are preserved as links.
+///
+/// # Arguments
+///
+/// * `file` - Staging file that receives the archive bytes
+/// * `entries` - Absolute paths of selected files, directories, and links
+/// * `gzip` - Stream-wide gzip level, or `None` for uncompressed TAR
+/// * `progress` - Counter incremented once per non-directory member
+/// * `cancelled` - Flag checked between members and during copies
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set during the walk or copy
+/// - [`Failed`] if a member cannot be opened or TAR/gzip encoding fails
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+pub(super) fn compress_tar(
+    file: impl Write,
+    entries: &[std::path::PathBuf],
+    gzip: Option<flate2::Compression>,
+    progress: &Arc<AtomicUsize>,
+    cancelled: &AtomicBool,
+) -> Result<(), ArchiveError> {
+    compression_result(cancelled, || {
+        let writer =
+            std::io::BufWriter::with_capacity(COPY_BUF, CompressionIo::new(file, cancelled));
+        if let Some(level) = gzip {
+            let mut encoder = flate2::write::GzEncoder::new(writer, level);
+            append_tar_entries(&mut encoder, entries, progress, cancelled)?;
+            encoder
+                .finish()
+                .map_err(|error| io_text(&error))?
+                .into_inner()
+                .map_err(|error| io_text(error.error()))?;
+        } else {
+            let mut writer = writer;
+            append_tar_entries(&mut writer, entries, progress, cancelled)?;
+            writer
+                .into_inner()
+                .map_err(|error| io_text(error.error()))?;
+        }
+        Ok(())
+    })
+}
+
+/// Appends `entries` to an already-constructed TAR builder on `writer`.
+///
+/// # Arguments
+///
+/// * `writer` - Destination of the TAR stream, possibly a gzip encoder
+/// * `entries` - Absolute paths of selected files, directories, and links
+/// * `progress` - Counter incremented once per non-directory member
+/// * `cancelled` - Flag checked between members
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set during the walk
+/// - [`Failed`] if a member cannot be opened or TAR encoding fails
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+fn append_tar_entries(
+    writer: &mut dyn std::io::Write,
+    entries: &[std::path::PathBuf],
+    progress: &Arc<AtomicUsize>,
+    cancelled: &AtomicBool,
+) -> Result<(), ArchiveError> {
+    let mut builder = tar::Builder::new(CompressionIo::new(writer, cancelled));
+    visit_archive_entries(entries, cancelled, &mut |path, source| {
+        let mut header = tar::Header::new_gnu();
+        match source {
+            ArchiveSource::Symlink { target, modified } => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_uid(0);
+                header.set_gid(0);
+                if let Some(seconds) = modified.and_then(unix_seconds) {
+                    header.set_mtime(seconds);
+                }
+                builder
+                    .append_link(&mut header, path, target)
+                    .map_err(|error| io_text(&error))?;
+            }
+            ArchiveSource::Directory(directory) => {
+                header.set_metadata(&directory.metadata().map_err(|error| io_text(&error))?);
+                return builder
+                    .append_data(&mut header, path, std::io::empty())
+                    .map_err(|error| archive_failed(io_text(&error)));
+            }
+            ArchiveSource::File(file) => {
+                let mut file = file.try_clone().map_err(|error| io_text(&error))?;
+                builder
+                    .append_file(path, &mut file)
+                    .map_err(|error| io_text(&error))?;
+            }
+        }
+        check_archive_cancelled(cancelled)?;
+        progress.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })?;
+    check_archive_cancelled(cancelled)?;
+    builder
+        .finish()
+        .map_err(|error| archive_failed(io_text(&error)))?;
+    Ok(())
+}
+
+pub(super) struct ArchiveSources {
+    pub files: usize,
+    has_compressible_files: bool,
+}
+
+impl ArchiveSources {
+    pub fn gzip_level(&self) -> flate2::Compression {
+        if self.has_compressible_files {
+            flate2::Compression::default()
+        } else {
+            // Gzip wraps the entire TAR stream: keep a valid gzip member, using
+            // stored DEFLATE blocks only when every payload is already compressed.
+            flate2::Compression::none()
+        }
+    }
+}
+
+/// Counts non-directory members and selects a stream-wide gzip policy without
+/// reading payloads. Unknown formats retain compression; links are never followed.
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set during the walk
+/// - [`Failed`] if a member cannot be opened
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+pub(super) fn inspect_archive_sources(
+    entries: &[PathBuf],
+    cancelled: &AtomicBool,
+) -> Result<ArchiveSources, ArchiveError> {
+    let mut sources = ArchiveSources {
+        files: 0,
+        has_compressible_files: false,
+    };
+    visit_archive_entries(entries, cancelled, &mut |path, source| {
+        if !matches!(source, ArchiveSource::Directory(_)) {
+            sources.files += 1;
+        }
+        if matches!(source, ArchiveSource::File(_)) && !is_incompressible(path) {
+            sources.has_compressible_files = true;
+        }
+        Ok(())
+    })?;
+    Ok(sources)
+}
+
+/// A filename heuristic, not a claim about every possible payload in a container.
+/// Unknown extensions and commonly raw containers (TAR, BMP, WAV, AVI, ISO) retain
+/// compression. ZIP/7Z choose per member; gzip can only choose for the whole TAR.
+const INCOMPRESSIBLE_EXTS: &[&str] = &[
+    "zip", "7z", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "zst", "tzst", "rar", "lz", "lz4",
+    "br", "mp4", "mkv", "mov", "webm", "flv", "wmv", "jpg", "jpeg", "png", "webp", "gif", "heic",
+    "avif", "mp3", "flac", "aac", "ogg", "opus", "wma", "m4a", "pdf", "epub", "docx", "xlsx",
+    "pptx", "odt", "ods", "odp", "deb", "rpm", "apk", "jar", "war",
+];
+
+/// Returns whether `path`'s extension is in [`INCOMPRESSIBLE_EXTS`].
+fn is_incompressible(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| INCOMPRESSIBLE_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Writes a 7z archive of `entries` into `file`.
+///
+/// Uses LZMA2 at level 6 with a thread count from
+/// [`std::thread::available_parallelism`]. An optional `password` adds AES
+/// encryption. Symbolic links are not supported.
+///
+/// # Arguments
+///
+/// * `file` - Staging file that receives the 7z bytes
+/// * `entries` - Absolute paths of selected files and directories
+/// * `password` - Optional AES password
+/// * `progress` - Counter incremented once per non-directory member
+/// * `cancelled` - Flag checked between members
+///
+/// # Errors
+///
+/// - [`Cancelled`] if `cancelled` is set during the walk
+/// - [`Failed`] if a member cannot be opened, a symbolic link is selected,
+///   or 7z encoding fails
+///
+/// [`Cancelled`]: ArchiveError::Cancelled
+/// [`Failed`]: ArchiveError::Failed
+pub(super) fn compress_7z(
+    file: impl Write + Seek,
+    entries: &[std::path::PathBuf],
+    password: Option<&str>,
+    progress: &Arc<AtomicUsize>,
+    cancelled: &AtomicBool,
+) -> Result<(), ArchiveError> {
+    use sevenz_rust2::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
+    compression_result(cancelled, || {
+        let mut writer = sevenz_rust2::ArchiveWriter::new(CompressionIo::new(file, cancelled))
+            .map_err(sevenz_text)?;
+        let lzma2 = sevenz_rust2::EncoderConfiguration::new(sevenz_rust2::EncoderMethod::LZMA2)
+            .with_options(EncoderOptions::Lzma2(Lzma2Options::from_level(6)));
+        let copy = sevenz_rust2::EncoderConfiguration::new(sevenz_rust2::EncoderMethod::COPY);
+        let methods = |codec| {
+            if let Some(pw) = password {
+                // The last coder sees plaintext. Keep AES first for both codecs,
+                // including the final configuration used to encrypt the header.
+                vec![AesEncoderOptions::new(pw.into()).into(), codec]
+            } else {
+                vec![codec]
+            }
+        };
+        let compressed_methods = methods(lzma2);
+        let stored_methods = methods(copy);
+        writer.set_content_methods(compressed_methods.clone());
+        visit_archive_entries(entries, cancelled, &mut |path, source| {
+            let name = path.to_str().ok_or_else(|| {
+                archive_failed(rust_i18n::t!(
+                    "7z cannot preserve the non-UTF-8 name of %{path}. Use TAR instead.",
+                    path = path.display()
+                ))
+            })?;
+            let (mut entry, file) = match source {
+                ArchiveSource::Symlink { .. } => {
+                    return Err(archive_failed(rust_i18n::t!(
+                        "7z compression does not support symbolic links: %{path}. Use ZIP or TAR instead.",
+                        path = path.display()
+                    )));
+                }
+                ArchiveSource::Directory(file) => {
+                    (sevenz_rust2::ArchiveEntry::new_directory(name), file)
+                }
+                ArchiveSource::File(file) => (sevenz_rust2::ArchiveEntry::new_file(name), file),
+            };
+            let metadata = file.metadata().map_err(|error| io_text(&error))?;
+            entry.has_windows_attributes = true;
+            entry.windows_attributes = FILE_ATTRIBUTE_UNIX_EXTENSION
+                | (metadata.permissions().mode() << 16)
+                | if metadata.is_dir() { 0x10 } else { 0x20 };
+            if is_incompressible(path) {
+                writer.set_content_methods(stored_methods.clone());
+            } else {
+                // Members are encoded independently. Avoid a 64 MiB work queue and
+                // detached codec threads; cap the dictionary to the member size.
+                let mut options = Lzma2Options::from_level(6);
+                options.set_dictionary_size(metadata.len().min(8 << 20) as u32);
+                let codec =
+                    sevenz_rust2::EncoderConfiguration::new(sevenz_rust2::EncoderMethod::LZMA2)
+                        .with_options(EncoderOptions::Lzma2(options));
+                writer.set_content_methods(methods(codec));
+            }
+            if let Ok(modified) = metadata.modified()
+                && let Ok(date) = sevenz_rust2::NtTime::try_from(modified)
+            {
+                entry.last_modified_date = date;
+                entry.has_last_modified_date = u64::from(date) > 0;
+            }
+            if let Ok(created) = metadata.created()
+                && let Ok(date) = sevenz_rust2::NtTime::try_from(created)
+            {
+                entry.creation_date = date;
+                entry.has_creation_date = u64::from(date) > 0;
+            }
+            if let Ok(accessed) = metadata.accessed()
+                && let Ok(date) = sevenz_rust2::NtTime::try_from(accessed)
+            {
+                entry.access_date = date;
+                entry.has_access_date = u64::from(date) > 0;
+            }
+            let reader = if matches!(source, ArchiveSource::Directory(_)) {
+                None
+            } else {
+                Some(CompressionIo::new(file, cancelled))
+            };
+            let has_reader = reader.is_some();
+            writer
+                .push_archive_entry(entry, reader)
+                .map_err(|error| archive_failed(sevenz_text(error)))?;
+            check_archive_cancelled(cancelled)?;
+            if has_reader {
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        })?;
+        check_archive_cancelled(cancelled)?;
+        writer
+            .finish()
+            .map_err(|error| archive_failed(io_text(&error)))?;
+        Ok(())
+    })
+}

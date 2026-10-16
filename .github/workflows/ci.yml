@@ -1,97 +1,559 @@
 name: CI
 
-# Every push and pull request: format, lint, tests, and a package per architecture, kept as
-# artifacts. Nothing here publishes anything — a release is a deliberate act, `release.yml`,
-# run by hand: it takes a CI run's packages, drives one under a compositor, tags the commit they
-# were built from and publishes them. What ships is what CI built and tested, and no commit
-# becomes a release on its own.
 on:
   workflow_dispatch:
     inputs:
-      revision:
-        description: 'Commit or tag to validate (empty uses the selected branch)'
-        type: string
-        default: ''
+      require_published_environments:
+        description: Bypass the fast dependency cache and require verified published base images
+        type: boolean
+        default: false
   push:
     branches: [main]
-    paths-ignore: ['docs/**', '**/*.md']
   pull_request:
-    paths-ignore: ['docs/**', '**/*.md']
+    types: [opened, synchronize, reopened, ready_for_review]
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.require_published_environments && 'published' || 'normal' }}
+  cancel-in-progress: true
 
 jobs:
-  # Everything cargo, and the package, per architecture: one container, one checkout, one cache.
-  # The package job used to be separate and built the release binaries again from cold; now
-  # makepkg builds into the same cached `target/` the tests use. Cargo runs as `builder`
-  # throughout because makepkg refuses root; root only installs packages.
-  rust:
-    name: Daemon, plugins and package (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.image }}
+  quality-build:
+    name: Quality build and lint
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    timeout-minutes: 20
+    outputs:
+      environment_image: ${{ steps.environment.outputs.environment_image }}
+      candidate: ${{ steps.environment.outputs.candidate }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up image inspection
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker
+
+      - name: Resolve the shared environment or build an explicit recipe update
+        id: environment
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || 'HEAD^' }}
+        run: |
+          if reference="$(python3 scripts/e2e_images.py environment)"; then
+            docker pull --platform=linux/amd64 "${reference#environment_image=}"
+          else
+            git cat-file -e "$BASE_REF^{commit}"
+            if git diff --quiet "$BASE_REF" HEAD -- tests/e2e/Dockerfile tests/e2e/requirements.txt tests/e2e/install-packages.sh tests/e2e/gtk; then
+              echo 'The unchanged environment is unavailable. Restore public access; ordinary quality runs do not bootstrap distribution packages.' >&2
+              exit 1
+            else
+              status=$?
+              if [[ "$status" != 1 ]]; then exit "$status"; fi
+            fi
+            echo 'Environment inputs changed: explicitly building this unpublished candidate without publishing it.'
+            reference="environment_image=$(python3 scripts/e2e_base.py build --engine docker)"
+            echo 'candidate=true' >> "$GITHUB_OUTPUT"
+          fi
+          printf '%s\n' "$reference" >> "$GITHUB_OUTPUT"
+          echo "inputs=$(python3 scripts/e2e_bundle.py image-key)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore quality-only Cargo cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/quality-container/cargo
+            target/quality-container/build
+          key: pathfm-quality-v1-${{ steps.environment.outputs.inputs }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            pathfm-quality-v1-${{ steps.environment.outputs.inputs }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}-
+
+      - name: Check formatting
+        env:
+          PATHFM_CONTAINER_ENGINE: docker
+          PATHFM_QUALITY_IMAGE: ${{ steps.environment.outputs.environment_image }}
+        run: ./scripts/quality.sh fmt
+
+      - name: Run Clippy
+        env:
+          PATHFM_CONTAINER_ENGINE: docker
+          PATHFM_QUALITY_IMAGE: ${{ steps.environment.outputs.environment_image }}
+        run: ./scripts/quality.sh clippy
+
+      - name: Check and exercise the build without UnRAR
+        env:
+          IMAGE: ${{ steps.environment.outputs.environment_image }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=$PWD,target=/workspace" \
+            --mount "type=bind,source=$PWD/target/quality-container/accounts-$(id -u)-$(id -g)/passwd,target=/etc/passwd,readonly" \
+            --mount "type=bind,source=$PWD/target/quality-container/accounts-$(id -u)-$(id -g)/group,target=/etc/group,readonly" \
+            --workdir /workspace \
+            --env HOME=/tmp/pathfm-quality-home \
+            --env CARGO_HOME=/workspace/target/quality-container/cargo \
+            --env CARGO_TARGET_DIR=/workspace/target/quality-container/build \
+            --env CARGO_PROFILE_DEV_DEBUG=0 --env CARGO_INCREMENTAL=0 \
+            "$IMAGE" bash -euc '
+              mkdir -p "$HOME"
+              cargo tree --locked --no-default-features -e normal,build --prefix none > /tmp/dependencies.txt
+              if grep -E "^unrar(_sys)? v" /tmp/dependencies.txt; then
+                echo "UnRAR must not be in the feature-disabled dependency graph" >&2
+                exit 1
+              fi
+              cargo check --locked --all-targets --no-default-features
+              cargo test --locked --all-targets --no-default-features services::operations::tests
+              cargo test --locked --all-targets --no-default-features rar_disabled
+              xvfb-run -a -s "-screen 0 1280x1024x24 -nolisten tcp -noreset" dbus-run-session -- \
+                env -u WAYLAND_DISPLAY GDK_BACKEND=x11 GTK_A11Y=none NO_AT_BRIDGE=1 PATHFM_REQUIRE_GTK_TESTS=1 \
+                cargo test --locked --all-targets --no-default-features archive_extraction_actions_follow_build_support
+            '
+
+      - name: Compile all test targets once and plan two shards
+        env:
+          PATHFM_CONTAINER_ENGINE: docker
+          PATHFM_QUALITY_IMAGE: ${{ steps.environment.outputs.environment_image }}
+          PATHFM_QUALITY_TASK: build
+        run: ./scripts/quality.sh test
+
+      - name: Share test binaries and inventory
+        if: ${{ github.event_name != 'push' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-bundle-${{ github.run_attempt }}
+          path: target/quality-bundle
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Share the small quality plan separately
+        if: ${{ github.event_name != 'push' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-plan-${{ github.run_attempt }}
+          path: target/quality-bundle/plan.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Export an unpublished candidate environment for the shards
+        if: github.event_name != 'push' && steps.environment.outputs.candidate == 'true'
+        env:
+          IMAGE: ${{ steps.environment.outputs.environment_image }}
+        run: |
+          mkdir -p target/quality-environment
+          docker save "$IMAGE" | zstd -T0 -1 > target/quality-environment/image.tar.zst
+
+      - name: Share the unpublished environment without publishing it
+        if: github.event_name != 'push' && steps.environment.outputs.candidate == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-environment-${{ github.run_attempt }}
+          path: target/quality-environment/image.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Save trusted quality cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/quality-container/cargo
+            target/quality-container/build
+          key: pathfm-quality-v1-${{ steps.environment.outputs.inputs }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}-${{ github.sha }}
+
+  quality-shard:
+    name: Rust tests shard ${{ matrix.shard }}
+    if: ${{ github.event_name != 'push' }}
+    needs: quality-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { arch: x86_64,  runner: ubuntu-latest,    image: "archlinux:latest" }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, image: "menci/archlinuxarm:base-devel" }
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        shard: [0, 1]
     steps:
-      - name: Install toolchain
-        run: |
-          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf sudo \
-            openssh vsftpd ffmpeg dbus xdg-desktop-portal libpng glib2 gvfs gvfs-smb python neovim
-          useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.revision || github.sha }}
-      - uses: actions/cache@v6
-        with:
-          path: |
-            /home/builder/.cargo/registry
-            /home/builder/.cargo/git
-            target
-          key: cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-      - run: chown -R builder . /home/builder
-      - name: Format and lint
-        run: sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" make lint
-      - name: Unit and integration tests
-        run: sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" make test-rust
-      - name: Protocol and plugin contract tests
-        run: sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo test --test '*' -- --include-ignored
-      - name: makepkg
-        # `--nocheck`: the PKGBUILD's check() is the whole test suite again in release profile,
-        # and it has just run above on this commit. Building by hand still runs it.
-        # `PKGEXT`: Arch Linux ARM's makepkg.conf says `.pkg.tar.xz`; the
-        # release names the file with `.zst` on both architectures, so this does too.
-        run: |
-          sudo -u builder env HOME=/home/builder CARGO_TARGET_DIR="$CARGO_TARGET_DIR" PKGEXT=.pkg.tar.zst bash -c 'cd packaging && makepkg -f --nodeps --noconfirm --nocheck'
-          cd packaging && ls -l && sha256sum path-*.pkg.tar.zst > "$(ls path-*.pkg.tar.zst).sha256" && ls -l path-*
-      - uses: actions/upload-artifact@v7
-        with:
-          name: path-package-${{ matrix.arch }}
-          path: |
-            packaging/path-*.pkg.tar.zst
-            packaging/path-*.pkg.tar.zst.sha256
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-  qml:
-    name: QML leaf and interaction tests
-    runs-on: ubuntu-latest
-    container: archlinux:latest
-    steps:
-      - name: Install Qt
-        # Beyond Qt itself: the SVG plugin the icons are drawn with, QtMultimedia and its ffmpeg
-        # backend for the info panel's video player, and a font — a bare container has none, and
-        # text with no metrics reports a pixel size of -1 and lays out on top of its neighbours.
-        run: |
-          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed make xorg-server-xvfb \
-            qt6-base qt6-declarative qt6-svg qt6-multimedia qt6-multimedia-ffmpeg ttf-liberation
-      - uses: actions/checkout@v7
+      - name: Pull the exact published environment
+        if: needs.quality-build.outputs.candidate != 'true'
+        env:
+          IMAGE: ${{ needs.quality-build.outputs.environment_image }}
+        run: docker pull --platform=linux/amd64 "$IMAGE"
+
+      - name: Download an unpublished candidate environment
+        if: needs.quality-build.outputs.candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          ref: ${{ inputs.revision || github.sha }}
-      - name: Run qmltestrunner
+          name: quality-environment-${{ github.run_attempt }}
+          path: target/quality-environment
+
+      - name: Load the unpublished candidate
+        if: needs.quality-build.outputs.candidate == 'true'
+        run: zstd -dc target/quality-environment/image.tar.zst | docker load
+
+      - name: Download this attempt's test binaries and plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: quality-bundle-${{ github.run_attempt }}
+          path: target/quality-bundle
+
+      - name: Run assigned tests on a private display and bus without compiling
+        env:
+          PATHFM_CONTAINER_ENGINE: docker
+          PATHFM_QUALITY_IMAGE: ${{ needs.quality-build.outputs.environment_image }}
+          PATHFM_QUALITY_TASK: shard
+          PATHFM_QUALITY_SHARD: ${{ matrix.shard }}
+        run: ./scripts/quality.sh test
+
+      - name: Share quality reports and logs even on failure
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quality-report-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: target/quality-reports
+          if-no-files-found: error
+          retention-days: 7
+
+  quality:
+    name: Format, lint, and test
+    needs: [quality-build, quality-shard]
+    if: ${{ always() && github.event_name != 'push' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require successful compilation, lint, and every shard
+        env:
+          BUILD_RESULT: ${{ needs.quality-build.result }}
+          SHARD_RESULT: ${{ needs.quality-shard.result }}
+        run: test "$BUILD_RESULT" = success && test "$SHARD_RESULT" = success
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the quality plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: quality-plan-${{ github.run_attempt }}
+          path: target/quality-bundle
+
+      - name: Download all quality reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: quality-report-${{ github.run_attempt }}-*
+          path: target/quality-reports
+          merge-multiple: true
+
+      - name: Verify exact Rust test coverage
+        run: python3 scripts/quality_ci.py verify
+
+  e2e-build:
+    name: E2E build and plan
+    runs-on: ubuntu-24.04
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
+    if: ${{ github.event_name != 'push' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    # Bound hung bootstrap jobs independently of informational timing reports.
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      runtime_key: ${{ steps.identity.outputs.runtime_key }}
+      runtime_cached: ${{ steps.runtime-cache.outputs.cache-hit == 'true' || steps.runtime-ready.outputs.cache-hit == 'true' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Container account
+        id: identity
         run: |
-          export QT_QPA_PLATFORM=offscreen
-          make test-qml
+          echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+          echo "gid=$(id -g)" >> "$GITHUB_OUTPUT"
+          image_key=$(python3 scripts/e2e_bundle.py image-key)
+          echo "image_key=$image_key" >> "$GITHUB_OUTPUT"
+          echo "runtime_key=pathfm-e2e-runtime-v1-$image_key-$(id -u)-$(id -g)" >> "$GITHUB_OUTPUT"
+
+      - name: Look up the immutable runtime archive without downloading it
+        id: runtime-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/e2e-runtime/runtime.tar.zst
+          key: ${{ steps.identity.outputs.runtime_key }}
+          lookup-only: true
+
+      - name: Restore the compiled dependency layers with segmented cache transfers
+        if: ${{ !inputs.require_published_environments }}
+        id: dependency-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/e2e-dependency-cache
+          key: pathfm-e2e-dependencies-local-v1-${{ steps.identity.outputs.image_key }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.dockerignore') }}-${{ steps.identity.outputs.uid }}-${{ steps.identity.outputs.gid }}
+
+      - name: Set up cached container builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Resolve trusted published base images to OCI digests
+        if: steps.dependency-cache.outputs.cache-hit != 'true'
+        id: registry
+        env:
+          REQUIRE_PUBLISHED: ${{ inputs.require_published_environments }}
+        run: |
+          if [ "$REQUIRE_PUBLISHED" = true ]; then
+            python3 scripts/e2e_images.py bases --require-published >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/e2e_images.py bases >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the tested revision once and collect its exact inventory
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: tests/e2e/Dockerfile
+          target: bundle
+          platforms: linux/amd64
+          build-args: |
+            E2E_UID=${{ steps.identity.outputs.uid }}
+            E2E_GID=${{ steps.identity.outputs.gid }}
+            PATHFM_BUILD_COMMIT=${{ github.sha }}
+            E2E_DEPENDENCIES_IMAGE=${{ steps.registry.outputs.dependencies_image || 'dependencies' }}
+          outputs: type=local,dest=target/e2e-bundle
+          cache-from: |
+            ${{ steps.dependency-cache.outputs.cache-hit == 'true' && 'type=local,src=target/e2e-dependency-cache' || '' }}
+            ${{ steps.dependency-cache.outputs.cache-hit != 'true' && steps.registry.outputs.dependencies_image == 'dependencies' && 'type=gha,scope=pathfm-e2e-dependencies-v1' || '' }}
+            ${{ steps.dependency-cache.outputs.cache-hit != 'true' && steps.registry.outputs.dependencies_image == 'dependencies' && 'type=gha,scope=pathfm-e2e-v1' || '' }}
+            ${{ steps.dependency-cache.outputs.cache-hit != 'true' && steps.registry.outputs.dependencies_image == 'dependencies' && 'type=gha,scope=pathfm-e2e-indexes-v1' || '' }}
+            ${{ steps.registry.outputs.dependencies_image == 'dependencies' && steps.registry.outputs.cache_from || '' }}
+
+      - name: Prepare a runtime archive on cache miss
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        run: mkdir -p target/e2e-runtime
+
+      - name: Export the pinned runtime once for every shard
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: tests/e2e/Dockerfile
+          target: ci-runtime
+          platforms: linux/amd64
+          build-args: |
+            E2E_UID=${{ steps.identity.outputs.uid }}
+            E2E_GID=${{ steps.identity.outputs.gid }}
+            E2E_RUNTIME_IMAGE=${{ steps.registry.outputs.runtime_image || 'runtime' }}
+          labels: ${{ (steps.registry.outputs.runtime_image == '' || steps.registry.outputs.runtime_image == 'runtime') && format('org.pathfm.e2e.inputs={0}', steps.identity.outputs.image_key) || '' }}
+          tags: pathfm-e2e:ci-runtime
+          outputs: type=docker,dest=target/e2e-runtime/runtime.tar
+          cache-from: |
+            ${{ steps.dependency-cache.outputs.cache-hit == 'true' && 'type=local,src=target/e2e-dependency-cache' || '' }}
+            ${{ steps.dependency-cache.outputs.cache-hit != 'true' && steps.registry.outputs.runtime_image == 'runtime' && 'type=gha,scope=pathfm-e2e-dependencies-v1' || '' }}
+            ${{ steps.dependency-cache.outputs.cache-hit != 'true' && steps.registry.outputs.runtime_image == 'runtime' && 'type=gha,scope=pathfm-e2e-v1' || '' }}
+            ${{ steps.dependency-cache.outputs.cache-hit != 'true' && steps.registry.outputs.runtime_image == 'runtime' && 'type=gha,scope=pathfm-e2e-indexes-v1' || '' }}
+            ${{ steps.registry.outputs.runtime_image == 'runtime' && steps.registry.outputs.cache_from || '' }}
+
+      - name: Compress the runtime without another image load or build
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        run: zstd -T0 -1 --rm target/e2e-runtime/runtime.tar
+
+      - name: Cache the immutable runtime independently of source revisions
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/e2e-runtime/runtime.tar.zst
+          key: ${{ steps.identity.outputs.runtime_key }}
+
+      - name: Confirm publication before choosing the shard transport
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        id: runtime-ready
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/e2e-runtime/runtime.tar.zst
+          key: ${{ steps.identity.outputs.runtime_key }}
+          lookup-only: true
+
+      - name: Share the runtime when cache publication is unavailable or read-only
+        if: steps.runtime-cache.outputs.cache-hit != 'true' && steps.runtime-ready.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-runtime-${{ github.run_attempt }}
+          path: target/e2e-runtime/runtime.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Generate the runner matrix
+        id: plan
+        run: python3 scripts/e2e_ci.py matrix target/e2e-bundle/plan.json >> "$GITHUB_OUTPUT"
+
+      - name: Share the binary and plan, not Cargo or a toolchain
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-bundle-${{ github.run_attempt }}
+          path: target/e2e-bundle
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Share the small plan separately for aggregation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-plan-${{ github.run_attempt }}
+          path: target/e2e-bundle/plan.json
+          if-no-files-found: error
+          retention-days: 1
+
+  e2e-shard:
+    name: E2E shard ${{ matrix.shard }}
+    needs: e2e-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.e2e-build.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Restore only the exact pinned runtime archive
+        if: needs.e2e-build.outputs.runtime_cached == 'true'
+        id: runtime-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/e2e-runtime/runtime.tar.zst
+          key: ${{ needs.e2e-build.outputs.runtime_key }}
+          fail-on-cache-miss: true
+
+      - name: Download the runtime artifact when the cache is unavailable
+        if: needs.e2e-build.outputs.runtime_cached != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-runtime-${{ github.run_attempt }}
+          path: target/e2e-runtime
+
+      - name: Download this attempt's binary and complete shard plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-bundle-${{ github.run_attempt }}
+          path: target/e2e-bundle
+
+      - name: Load the shared runtime without BuildKit or registry access
+        shell: bash
+        env:
+          RUNTIME_CACHED: ${{ needs.e2e-build.outputs.runtime_cached }}
+          RUNTIME_CACHE_HIT: ${{ steps.runtime-restore.outputs.cache-hit }}
+        run: |
+          if [[ "$RUNTIME_CACHED" == true && "$RUNTIME_CACHE_HIT" != true ]]; then
+            echo "::error::Runtime cache did not match the exact pinned key"
+            exit 1
+          fi
+          zstd -dc target/e2e-runtime/runtime.tar.zst | docker load
+
+      - name: Run the assigned scenarios without rebuilding or installing
+        env:
+          PATHFM_CONTAINER_ENGINE: docker
+          PATHFM_E2E_IMAGE: pathfm-e2e:ci-runtime
+          PATHFM_E2E_BUNDLE: target/e2e-bundle
+          PATHFM_E2E_WORKERS: '2'
+          SHARD: ${{ matrix.shard }}
+        run: |
+          chmod +x target/e2e-bundle/pathfm
+          ./scripts/e2e.sh -p no:cacheprovider --timeout=60 \
+            --e2e-plan=target/e2e-bundle/plan.json --e2e-shard="$SHARD" \
+            --e2e-report="target/e2e-reports/shard-$SHARD.json" \
+            --junitxml="target/e2e-reports/shard-$SHARD.xml" --durations=10
+
+      - name: Upload shard results even on failure
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-report-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: target/e2e-reports
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload failure artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-artifacts-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: target/e2e-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e:
+    name: End-to-end GUI suite
+    needs: [e2e-build, e2e-shard]
+    if: ${{ always() && github.event_name != 'push' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the plan
+        if: ${{ needs.e2e-build.result == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-plan-${{ github.run_attempt }}
+          path: target/e2e-bundle
+
+      - name: Download all shard reports
+        if: ${{ !cancelled() && needs.e2e-build.result == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: e2e-report-${{ github.run_attempt }}-*
+          path: target/e2e-reports
+          merge-multiple: true
+
+      - name: Explain unsuccessful prerequisites and require them to succeed
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.e2e-build.result }}
+          SHARD_RESULT: ${{ needs.e2e-shard.result }}
+        run: python3 scripts/e2e_ci.py dependencies
+
+      - name: Verify exact coverage
+        run: python3 scripts/e2e_ci.py verify target/e2e-bundle/plan.json target/e2e-reports
+
+      - name: Report E2E timing without affecting test results
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/e2e_ci.py timing
+
+  release-scripts:
+    name: Release workflow scripts
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'push' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test CI and release helpers
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  repository-policy:
+    name: Dependency and spelling policy
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+
+      - name: Check spelling
+        if: ${{ !cancelled() }}
+        uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3

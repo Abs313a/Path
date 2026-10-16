@@ -1,0 +1,949 @@
+// SPDX-License-Identifier: MIT
+
+use std::{
+    fs,
+    io::{Read as _, Write as _},
+    net::TcpListener,
+    os::unix::fs::symlink,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+
+use super::{
+    APPLICATION_ICON, DESKTOP_ENTRY, InstallCancel, InstallRequest, InstallStop, UpdateInstall,
+    UpdateMethod, aur_repository_version_from_response, desktop_entry_with_exec,
+    download::DownloadTimeouts, download_to_file_bounded, download_to_file_with, is_old_instance,
+    package_repository_version_for, parse_aur_package_version, parse_package_version,
+    refresh_desktop_metadata, repository_database_version, restore_rollback, retire_old_instances,
+    stage_binary_path, stage_rollback, stage_workdir, update_method_for, verified_download_url,
+    verify_staged_binary,
+};
+
+#[test]
+fn old_instance_selection_retires_chooser_and_file_manager_not_helpers_or_other_binaries() {
+    let root = tempfile::tempdir().expect("process fixture");
+    let binary = root.path().join("old-pathfm");
+    let other = root.path().join("other-pathfm");
+    fs::write(&binary, b"old").expect("old binary");
+    fs::write(&other, b"other").expect("unrelated binary");
+    let old = fs::metadata(&binary).expect("old metadata");
+    let proc_entry = root.path().join("12345");
+    fs::create_dir(&proc_entry).expect("process directory");
+    symlink(&binary, proc_entry.join("exe")).expect("process executable");
+    for arguments in [
+        b"pathfm\0".as_slice(),
+        b"pathfm\0/home/user\0".as_slice(),
+        b"pathfm\0--portal\0".as_slice(),
+    ] {
+        fs::write(proc_entry.join("cmdline"), arguments).expect("process arguments");
+        assert!(is_old_instance(&proc_entry, &binary, &old));
+    }
+    for arguments in [
+        b"pathfm\0--browser-worker\0".as_slice(),
+        b"pathfm\0--preview-helper\0".as_slice(),
+        b"pathfm\0--install-portal\0".as_slice(),
+    ] {
+        fs::write(proc_entry.join("cmdline"), arguments).expect("helper arguments");
+        assert!(!is_old_instance(&proc_entry, &binary, &old));
+    }
+    fs::write(proc_entry.join("cmdline"), b"pathfm\0--portal\0").expect("chooser arguments");
+    fs::remove_file(proc_entry.join("exe")).expect("remove old executable link");
+    symlink(&other, proc_entry.join("exe")).expect("unrelated executable link");
+    assert!(!is_old_instance(&proc_entry, &binary, &old));
+    fs::remove_file(proc_entry.join("exe")).expect("remove unrelated link");
+    let deleted = root.path().join("old-pathfm (deleted)");
+    fs::write(&deleted, b"older").expect("earlier binary");
+    symlink(&deleted, proc_entry.join("exe")).expect("earlier executable link");
+    assert!(is_old_instance(&proc_entry, &binary, &old));
+}
+
+#[test]
+fn in_place_retirement_signals_and_waits_for_an_owned_process() {
+    let sleep = crate::trusted_command::resolve("sleep").expect("trusted sleep");
+    let root = tempfile::tempdir().expect("private proc fixture");
+    let mut child = std::process::Command::new(&sleep)
+        .arg("30")
+        .spawn()
+        .expect("start owned process");
+    let pid = child.id();
+    symlink(format!("/proc/{pid}"), root.path().join(pid.to_string()))
+        .expect("fixture process link");
+    let old = fs::metadata(&sleep).expect("old executable metadata");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !is_old_instance(&root.path().join(pid.to_string()), &sleep, &old)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    retire_old_instances(root.path(), &sleep, &old);
+    let status = child.try_wait().expect("inspect retired process");
+    if status.is_none() {
+        child.kill().expect("clean up process after failure");
+        child.wait().expect("reap process after failure");
+    }
+    assert!(
+        status.is_some(),
+        "retirement must wait until the old process exits"
+    );
+}
+
+const PACKAGED_ENTRY: &str = "[Desktop Entry]\nType=Application\nName=Path\nExec=pathfm %U\nIcon=io.github.christitustech.Path\n";
+
+fn scratch_dir(label: &str, line: u32) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "pathfm-update-install-test-{label}-{}-{line}",
+        std::process::id()
+    ));
+    let _removed = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+fn packaged_metadata(package_dir: &Path) {
+    fs::create_dir_all(package_dir).expect("create package dir");
+    fs::write(package_dir.join(DESKTOP_ENTRY), PACKAGED_ENTRY).expect("write packaged entry");
+    fs::write(
+        package_dir.join(APPLICATION_ICON),
+        include_bytes!("../../../app-images/path-app-list.png"),
+    )
+    .expect("write packaged icon");
+}
+
+fn installed_icon(data_home: &Path) -> PathBuf {
+    data_home
+        .join("icons/hicolor/512x512/apps")
+        .join(APPLICATION_ICON)
+}
+
+fn ownership_probe(dir: &Path, exit_code: u8) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = dir.join("pacman");
+    fs::write(&probe, format!("#!/bin/sh\nexit {exit_code}\n")).expect("write ownership probe");
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))
+        .expect("make ownership probe executable");
+    probe
+}
+
+#[test]
+fn arch_package_versions_drop_epoch_and_package_release() {
+    assert_eq!(
+        parse_package_version("0.8.1-1").map(|version| version.to_string()),
+        Some("0.8.1".to_owned())
+    );
+    assert_eq!(
+        parse_package_version("2:0.9.0-rc.1-3.1").map(|version| version.to_string()),
+        Some("0.9.0-rc.1".to_owned())
+    );
+    assert!(parse_package_version("0.8.1").is_none());
+    assert!(parse_package_version("not-a-version-1").is_none());
+}
+
+#[test]
+fn aur_package_versions_restore_upstream_prerelease_separators() {
+    for (package, release) in [
+        ("0.9.0-1", "0.9.0"),
+        ("0.10.0rc.2-1", "0.10.0-rc.2"),
+        ("2:0.10.0beta.1-3", "0.10.0-beta.1"),
+    ] {
+        assert_eq!(
+            parse_aur_package_version(package).map(|version| version.to_string()),
+            Some(release.to_owned())
+        );
+    }
+}
+
+#[test]
+fn aur_response_selects_the_named_package() {
+    let response = r#"{
+        "resultcount": 2,
+        "results": [
+            {"Name": "another-package", "Version": "9.0.0-1"},
+            {"Name": "pathfm-rc-bin", "Version": "0.10.0rc.2-1"}
+        ]
+    }"#;
+
+    assert_eq!(
+        aur_repository_version_from_response(response, "pathfm-rc-bin")
+            .map(|version| version.to_string()),
+        Ok("0.10.0-rc.2".to_owned())
+    );
+    assert!(aur_repository_version_from_response(response, "pathfm-bin").is_err());
+}
+
+#[test]
+fn repository_probe_selects_pathfm_instead_of_a_dependency() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let probe = dir.path().join("pacman");
+    fs::write(
+        &probe,
+        "#!/bin/sh\nprintf '%s\\n' 'dependency 9.8.7-1' 'pathfm 0.8.1-1'\n",
+    )
+    .expect("write probe");
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("make probe executable");
+
+    assert_eq!(
+        package_repository_version_for(&probe, "pathfm").map(|version| version.to_string()),
+        Ok("0.8.1".to_owned())
+    );
+}
+
+#[test]
+fn distro_database_reports_the_packaged_pathfm_version() {
+    let description = b"%NAME%\npathfm\n\n%VERSION%\n0.8.1-2\n";
+    let mut archive = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut archive);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(description.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "pathfm-0.8.1-2/desc", &description[..])
+            .expect("append package description");
+        builder.finish().expect("finish repository archive");
+    }
+    let database = zstd::stream::encode_all(&archive[..], 0).expect("compress repository database");
+
+    assert_eq!(
+        repository_database_version(&database, "pathfm").map(|version| version.to_string()),
+        Ok("0.8.1".to_owned())
+    );
+}
+
+#[test]
+fn distro_package_ownership_defers_updates_to_distro() {
+    let dir = tempfile::tempdir().expect("create scratch dir");
+    let probe = ownership_probe(dir.path(), 0);
+    let os_release = dir.path().join("os-release");
+    fs::write(&os_release, "NAME=\"Distro\"\nID=distro\nID_LIKE=arch\n").expect("write os-release");
+
+    assert_eq!(
+        update_method_for(Path::new("/usr/bin/pathfm"), &probe, &os_release),
+        UpdateMethod::Distro
+    );
+}
+
+#[test]
+fn ownership_probe_errors_disable_in_place_updates() {
+    let dir = tempfile::tempdir().expect("create scratch dir");
+    let os_release = dir.path().join("os-release");
+    fs::write(&os_release, "ID=distro\n").expect("write os-release");
+
+    assert_eq!(
+        update_method_for(Path::new("/usr/bin/pathfm"), dir.path(), &os_release),
+        UpdateMethod::Distro
+    );
+}
+
+#[test]
+fn non_distro_pacman_ownership_defers_updates_to_pacman() {
+    let dir = tempfile::tempdir().expect("create scratch dir");
+    let probe = ownership_probe(dir.path(), 0);
+    let os_release = dir.path().join("os-release");
+    fs::write(&os_release, "ID=arch\n").expect("write os-release");
+
+    assert_eq!(
+        update_method_for(Path::new("/usr/bin/pathfm"), &probe, &os_release),
+        UpdateMethod::Pacman
+    );
+}
+
+#[test]
+fn unowned_release_binary_keeps_in_place_updates() {
+    let dir = tempfile::tempdir().expect("create scratch dir");
+    let probe = ownership_probe(dir.path(), 1);
+
+    assert_eq!(
+        update_method_for(
+            Path::new("/home/user/.local/bin/pathfm"),
+            &probe,
+            &dir.path().join("missing-os-release"),
+        ),
+        UpdateMethod::InPlace
+    );
+}
+
+#[test]
+fn stage_workdir_is_unique_per_call() {
+    let exe_dir = tempfile::tempdir().expect("create scratch exe dir");
+    let first = stage_workdir(exe_dir.path()).expect("stage first workdir");
+    let second = stage_workdir(exe_dir.path()).expect("stage second workdir");
+
+    assert_ne!(first.path(), second.path());
+    assert!(first.path().is_dir());
+    assert!(second.path().is_dir());
+    // Both live inside `exe_dir`, matching the old process-scoped scheme's
+    // placement, just no longer sharing a single path within it.
+    assert_eq!(first.path().parent(), Some(exe_dir.path()));
+    assert_eq!(second.path().parent(), Some(exe_dir.path()));
+}
+
+#[test]
+fn stage_binary_path_is_unique_per_call() {
+    let exe_dir = tempfile::tempdir().expect("create scratch exe dir");
+    let first = stage_binary_path(exe_dir.path()).expect("stage first binary path");
+    let second = stage_binary_path(exe_dir.path()).expect("stage second binary path");
+
+    assert_ne!(first.path(), second.path());
+    assert_eq!(first.path().parent(), Some(exe_dir.path()));
+    assert_eq!(second.path().parent(), Some(exe_dir.path()));
+}
+
+#[test]
+fn desktop_entry_exec_points_at_the_install_path_and_keeps_field_codes() {
+    let entry = desktop_entry_with_exec(PACKAGED_ENTRY, Path::new("/home/user/.local/bin/pathfm"));
+
+    assert!(entry.contains("Exec=/home/user/.local/bin/pathfm %U\n"));
+    assert!(entry.starts_with("[Desktop Entry]\n"));
+    assert!(entry.contains("Icon=io.github.christitustech.Path\n"));
+}
+
+#[test]
+fn desktop_entry_exec_quotes_paths_containing_spaces() {
+    let entry = desktop_entry_with_exec(PACKAGED_ENTRY, Path::new("/opt/my apps/pathfm"));
+
+    assert!(entry.contains("Exec=\"/opt/my apps/pathfm\" %U\n"));
+}
+
+#[test]
+fn desktop_entry_exec_escapes_reserved_characters_and_percent_signs() {
+    for (path, encoded) in [
+        ("/opt/50%/pathfm", "/opt/50%%/pathfm"),
+        ("/opt/%U%f%%/pathfm", "/opt/%%U%%f%%%%/pathfm"),
+        (
+            "/opt/it's \"quoted\" `$HOME\\pathfm",
+            r#""/opt/it's \\"quoted\\" \\`\\$HOME\\\\pathfm""#,
+        ),
+        (
+            "/opt/line\nbreak\tand\rreturn/pathfm",
+            r#""/opt/line\nbreak\tand\rreturn/pathfm""#,
+        ),
+    ] {
+        let entry = desktop_entry_with_exec(PACKAGED_ENTRY, Path::new(path));
+        assert!(entry.contains(&format!("Exec={encoded} %U\n")), "{entry}");
+    }
+}
+
+#[test]
+fn desktop_entry_exec_round_trips_string_and_argument_escaping() {
+    for character in [
+        ' ', '\t', '\n', '\r', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#',
+        '(', ')', '`',
+    ] {
+        let path = format!("/opt/before{character}after/pathfm");
+        let entry = desktop_entry_with_exec(PACKAGED_ENTRY, Path::new(&path));
+        assert!(entry.contains("Exec=\""), "{entry}");
+        let key_file = glib::KeyFile::new();
+        key_file
+            .load_from_data(&entry, glib::KeyFileFlags::NONE)
+            .expect("valid desktop entry");
+        let command = key_file
+            .string("Desktop Entry", "Exec")
+            .expect("Exec string");
+        let arguments = glib::shell_parse_argv(command).expect("valid quoted arguments");
+        assert_eq!(arguments, [path.as_str(), "%U"], "{entry}");
+    }
+}
+
+#[test]
+fn desktop_entry_exec_launches_reserved_characters_and_preserves_uri_arguments() {
+    use gio::prelude::AppInfoExt;
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+    let dir = scratch_dir("exec-launch", line!());
+    let executable = dir.join("pathfm ' \" `$\\");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0%/*}/arguments\"\n",
+    )
+    .expect("write argument recorder");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        .expect("make recorder executable");
+    let key_file = glib::KeyFile::new();
+    key_file
+        .load_from_data(
+            &desktop_entry_with_exec(PACKAGED_ENTRY, &executable),
+            glib::KeyFileFlags::NONE,
+        )
+        .expect("load desktop entry");
+    let app = gio_unix::DesktopAppInfo::from_keyfile(&key_file).expect("valid launcher");
+    let uris = ["https://example.org/one%20two", "https://example.org/%25U"];
+    app.launch_uris(&uris, None::<&gio::AppLaunchContext>)
+        .expect("launch recorder");
+    let expected = format!("{}\n", uris.join("\n"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read_to_string(dir.join("arguments")).ok().as_deref() == Some(&expected) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "arguments not received"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn desktop_entry_without_field_codes_keeps_a_bare_exec() {
+    let entry = desktop_entry_with_exec(
+        "[Desktop Entry]\nExec=pathfm\n",
+        Path::new("/usr/bin/pathfm"),
+    );
+
+    assert_eq!(entry, "[Desktop Entry]\nExec=/usr/bin/pathfm\n");
+}
+
+#[test]
+fn refresh_rewrites_an_installed_entry_and_icon() {
+    let dir = scratch_dir("refresh", line!());
+    let package_dir = dir.join("pathfm-0.7.0-x86_64-unknown-linux-gnu");
+    packaged_metadata(&package_dir);
+    let data_home = dir.join("share");
+    let applications = data_home.join("applications");
+    fs::create_dir_all(&applications).expect("create applications dir");
+    fs::write(
+        applications.join(DESKTOP_ENTRY),
+        "[Desktop Entry]\nExec=pathfm %U\nIcon=system-file-manager\n",
+    )
+    .expect("write stale entry");
+    let executable = dir.join("bin/pathfm");
+
+    refresh_desktop_metadata(&package_dir, &executable, &data_home);
+
+    let entry = fs::read_to_string(applications.join(DESKTOP_ENTRY)).expect("read entry");
+    assert!(entry.contains(&format!("Exec={} %U\n", executable.display())));
+    assert!(entry.contains("Icon=io.github.christitustech.Path\n"));
+    assert_eq!(
+        fs::read(installed_icon(&data_home)).expect("read icon"),
+        include_bytes!("../../../app-images/path-app-list.png")
+    );
+
+    fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn refresh_does_not_create_metadata_the_user_never_installed() {
+    let dir = scratch_dir("no-entry", line!());
+    let package_dir = dir.join("pathfm-0.7.0-x86_64-unknown-linux-gnu");
+    packaged_metadata(&package_dir);
+    let data_home = dir.join("share");
+
+    refresh_desktop_metadata(&package_dir, &dir.join("bin/pathfm"), &data_home);
+
+    assert!(!data_home.join("applications").join(DESKTOP_ENTRY).exists());
+    assert!(!installed_icon(&data_home).exists());
+
+    fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn refresh_keeps_an_installed_entry_when_the_archive_omits_metadata() {
+    let dir = scratch_dir("legacy-archive", line!());
+    let package_dir = dir.join("pathfm-0.7.0-x86_64-unknown-linux-gnu");
+    fs::create_dir_all(&package_dir).expect("create package dir");
+    let data_home = dir.join("share");
+    let applications = data_home.join("applications");
+    fs::create_dir_all(&applications).expect("create applications dir");
+    let existing = "[Desktop Entry]\nExec=pathfm %U\n";
+    fs::write(applications.join(DESKTOP_ENTRY), existing).expect("write entry");
+
+    refresh_desktop_metadata(&package_dir, &dir.join("bin/pathfm"), &data_home);
+
+    assert_eq!(
+        fs::read_to_string(applications.join(DESKTOP_ENTRY)).expect("read entry"),
+        existing
+    );
+
+    fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+fn request(tag: &str, asset: &str, advertised: &str) -> InstallRequest {
+    InstallRequest {
+        tag: tag.to_owned(),
+        asset_name: asset.to_owned(),
+        advertised_url: advertised.to_owned(),
+    }
+}
+
+const TAG: &str = "v0.11.2";
+
+fn release_url(tag: &str, asset: &str) -> String {
+    format!("https://github.com/ChrisTitusTech/Path/releases/download/{tag}/{asset}")
+}
+
+#[test]
+fn download_url_is_derived_from_the_release_tag_and_asset() {
+    let asset = super::super::update_check::archive_name("0.11.2");
+    let expected = release_url(TAG, &asset);
+
+    let url = verified_download_url(&request(TAG, &asset, &expected)).expect("url should verify");
+
+    assert_eq!(url, expected);
+}
+
+#[test]
+fn download_url_rejects_untrusted_locations_and_escaping_identities() {
+    let asset = super::super::update_check::archive_name("0.11.2");
+    let expected = release_url(TAG, &asset);
+    for advertised in [
+        expected.replace("github.com", "example.invalid"),
+        expected.replace("ChrisTitusTech/Path", "attacker/pathfm"),
+        expected.replace("https://", "http://"),
+        release_url("v0.11.1", &asset),
+        release_url(TAG, "unexpected.debug"),
+        expected.replace("https://", "https://user:token@"),
+    ] {
+        assert!(
+            verified_download_url(&request(TAG, &asset, &advertised)).is_err(),
+            "accepted {advertised}"
+        );
+    }
+    for (tag, asset) in [
+        (
+            "v0.11.2/../../../attacker/pathfm/releases/download/v1",
+            asset.as_str(),
+        ),
+        (TAG, "../../../attacker.tar.gz"),
+    ] {
+        assert!(verified_download_url(&request(tag, asset, &release_url(tag, asset))).is_err());
+    }
+}
+
+struct StubServer {
+    url: String,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StubServer {
+    fn serving(headers: String, body: Vec<u8>) -> Self {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback stub server");
+        let url = format!(
+            "http://{}/pathfm.tar.gz",
+            listener.local_addr().expect("stub server address")
+        );
+        let handle = std::thread::spawn(move || {
+            let Ok((mut stream, _peer)) = listener.accept() else {
+                return;
+            };
+            use std::io::{Read, Write};
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("request timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).expect("read request");
+                assert!(
+                    count > 0 && request.len() + count <= 8192,
+                    "complete bounded HTTP request"
+                );
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let _written = stream.write_all(headers.as_bytes());
+            let _written = stream.write_all(&body);
+            let _flushed = stream.flush();
+        });
+        Self {
+            url,
+            handle: Some(handle),
+        }
+    }
+
+    fn with_body(body: Vec<u8>) -> Self {
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        Self::serving(headers, body)
+    }
+
+    fn claiming(length: u64) -> Self {
+        let headers =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+        Self::serving(headers, Vec::new())
+    }
+}
+
+impl Drop for StubServer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _joined = handle.join();
+        }
+    }
+}
+
+fn download(
+    server: &StubServer,
+    destination: &Path,
+    limit: u64,
+    cancel: &InstallCancel,
+) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let outcome = download_to_file_bounded(&server.url, destination, limit, cancel, &sender);
+    drop(sender);
+    let _drained: Vec<_> = receiver.into_iter().collect();
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(InstallStop::Cancelled) => Err("cancelled".to_owned()),
+        Err(InstallStop::Failed(message)) => Err(message),
+    }
+}
+
+#[test]
+fn missing_signed_metadata_offers_manual_installation() {
+    let server = StubServer::serving(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        Vec::new(),
+    );
+    let result = super::fetch_update_metadata(&server.url, 8192, &InstallCancel::new());
+    assert!(
+        matches!(result, Err(InstallStop::Failed(message)) if message.contains("no signed update manifest") && message.contains("manually"))
+    );
+}
+
+#[test]
+fn signed_metadata_download_keeps_the_exact_published_bytes() {
+    let body = b"{ \"schema\": 1 }\n";
+    let server = StubServer::with_body(body.to_vec());
+    assert_eq!(
+        super::fetch_update_metadata(&server.url, body.len() as u64, &InstallCancel::new())
+            .expect("metadata download"),
+        body
+    );
+}
+
+#[test]
+fn a_download_within_the_ceiling_is_written_to_disk() {
+    let dir = scratch_dir("download-ok", line!());
+    let destination = dir.join("pathfm.tar.gz");
+    let server = StubServer::with_body(vec![b'x'; 2048]);
+
+    download(&server, &destination, 4096, &InstallCancel::new()).expect("download should succeed");
+
+    assert_eq!(
+        fs::metadata(&destination).expect("downloaded file").len(),
+        2048
+    );
+}
+
+#[test]
+fn a_download_advertising_more_than_the_ceiling_is_refused() {
+    let dir = scratch_dir("download-claimed", line!());
+    let destination = dir.join("pathfm.tar.gz");
+    let server = StubServer::claiming(64 * 1024);
+
+    let error = download(&server, &destination, 4096, &InstallCancel::new())
+        .expect_err("an oversized content-length must be refused");
+
+    assert!(
+        error.contains("larger than expected"),
+        "unexpected: {error}"
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn a_download_that_streams_past_the_ceiling_is_stopped() {
+    let dir = scratch_dir("download-streamed", line!());
+    let destination = dir.join("pathfm.tar.gz");
+    let server = StubServer::serving(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_owned(),
+        vec![b'x'; 64 * 1024],
+    );
+
+    let error = download(&server, &destination, 4096, &InstallCancel::new())
+        .expect_err("an oversized stream must be stopped");
+
+    assert!(
+        error.contains("larger than expected"),
+        "unexpected: {error}"
+    );
+    assert!(
+        fs::metadata(&destination).expect("partial file").len() <= 4096 + 64 * 1024,
+        "the partial download should not have been allowed to run away"
+    );
+}
+
+#[test]
+fn a_cancelled_download_stops_without_reporting_a_failure() {
+    let dir = scratch_dir("download-cancelled", line!());
+    let destination = dir.join("pathfm.tar.gz");
+    let server = StubServer::with_body(vec![b'x'; 2048]);
+    let cancel = InstallCancel::new();
+    cancel.cancel();
+
+    let error = download(&server, &destination, 4096, &cancel).expect_err("cancel must stop");
+
+    assert_eq!(error, "cancelled");
+}
+
+#[test]
+fn a_preserved_executable_is_restored_after_a_failed_replacement() {
+    let dir = scratch_dir("rollback", line!());
+    let installed = dir.join("pathfm");
+    fs::write(&installed, b"previous version").expect("write installed binary");
+
+    let rollback = stage_rollback(&installed, &dir).expect("stage rollback");
+    fs::write(&installed, b"broken replacement").expect("replace installed binary");
+    restore_rollback(&rollback, &installed).expect("restore rollback");
+
+    assert_eq!(
+        fs::read(&installed).expect("read restored binary"),
+        b"previous version"
+    );
+    assert!(!rollback.exists(), "the rollback copy should be consumed");
+}
+
+#[test]
+fn a_staged_binary_that_cannot_run_is_rejected_before_installation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("staged-binary", line!());
+    let staged = dir.join("pathfm");
+    fs::write(&staged, "#!/bin/sh\nexit 1\n").expect("write staged binary");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("make executable");
+
+    assert!(verify_staged_binary(&staged).is_err());
+}
+
+#[test]
+fn a_staged_binary_that_runs_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("staged-binary-ok", line!());
+    let staged = dir.join("pathfm");
+    fs::write(&staged, "#!/bin/sh\nexit 0\n").expect("write staged binary");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("make executable");
+
+    assert!(verify_staged_binary(&staged).is_ok());
+}
+
+struct TrickleServer {
+    url: String,
+    _release: mpsc::Sender<()>,
+}
+
+/// Keep the connection open after sending to distinguish a stall from early EOF.
+fn serve_trickle(
+    content_length: Option<usize>,
+    chunks: Vec<Vec<u8>>,
+    gap: Duration,
+) -> TrickleServer {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let (release, released) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut head = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(count) => head.extend_from_slice(&buffer[..count]),
+            }
+        }
+        if let Some(length) = content_length {
+            let head =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n");
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for chunk in chunks {
+                std::thread::sleep(gap);
+                if stream.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+        }
+        let _released = released.recv_timeout(Duration::from_secs(10));
+    });
+    TrickleServer {
+        url: format!("http://127.0.0.1:{port}/pathfm.tar.gz"),
+        _release: release,
+    }
+}
+
+fn chunks(count: usize, size: usize) -> Vec<Vec<u8>> {
+    (0..count).map(|index| vec![index as u8; size]).collect()
+}
+
+fn short_timeouts(idle: Duration) -> DownloadTimeouts {
+    DownloadTimeouts {
+        connect: Duration::from_secs(2),
+        response: Duration::from_secs(2),
+        idle,
+    }
+}
+
+struct TimedDownload {
+    result: Result<(), String>,
+    elapsed: Duration,
+    finished: Instant,
+    bytes: Vec<u8>,
+}
+
+fn timed_download(
+    server: &TrickleServer,
+    timeouts: DownloadTimeouts,
+    cancel: &InstallCancel,
+    on_progress: impl FnMut(UpdateInstall) + Send + 'static,
+) -> TimedDownload {
+    let dir = tempfile::tempdir().expect("download directory");
+    let destination = dir.path().join("pathfm.tar.gz");
+    let (progress, events) = mpsc::channel();
+    let observer = std::thread::spawn(move || events.into_iter().for_each(on_progress));
+    let started = Instant::now();
+    let result = download_to_file_with(
+        &server.url,
+        &destination,
+        64 * 1024 * 1024,
+        cancel,
+        &progress,
+        timeouts,
+    );
+    let finished = Instant::now();
+    drop(progress);
+    observer.join().expect("progress observer");
+    TimedDownload {
+        result: result.map_err(|stop| match stop {
+            InstallStop::Cancelled => "cancelled".to_owned(),
+            InstallStop::Failed(message) => message,
+        }),
+        elapsed: finished - started,
+        finished,
+        bytes: fs::read(&destination).unwrap_or_default(),
+    }
+}
+
+#[test]
+fn download_keeps_waiting_through_gaps_shorter_than_the_idle_limit() {
+    // Each gap outlasts one cancel poll, so a wait spans several polls, and
+    // the whole transfer takes twice the idle limit: there is no total cap.
+    let body = chunks(4, 4096);
+    let server = serve_trickle(Some(4 * 4096), body.clone(), Duration::from_millis(1500));
+    let idle = Duration::from_secs(3);
+
+    let download = timed_download(&server, short_timeouts(idle), &InstallCancel::new(), drop);
+
+    assert_eq!(download.result, Ok(()));
+    assert!(download.elapsed > idle * 2, "{:?}", download.elapsed);
+    assert_eq!(download.bytes, body.concat());
+}
+
+#[test]
+fn download_fails_when_the_body_stalls() {
+    let server = serve_trickle(Some(4 * 4096), chunks(1, 4096), Duration::ZERO);
+    let idle = Duration::from_millis(1500);
+
+    let download = timed_download(&server, short_timeouts(idle), &InstallCancel::new(), drop);
+
+    let error = download.result.expect_err("a stalled body must fail");
+    assert_eq!(
+        error,
+        "The download stalled — check your connection and try again"
+    );
+    assert!(download.elapsed >= idle, "{:?}", download.elapsed);
+    assert!(
+        download.elapsed < Duration::from_secs(5),
+        "{:?}",
+        download.elapsed
+    );
+}
+
+#[test]
+fn download_fails_when_headers_never_arrive() {
+    let server = serve_trickle(None, Vec::new(), Duration::ZERO);
+    // Longer than the test's bound, so only the idle limit can end the wait.
+    let timeouts = DownloadTimeouts {
+        response: Duration::from_secs(10),
+        ..short_timeouts(Duration::from_millis(1500))
+    };
+
+    let download = timed_download(&server, timeouts, &InstallCancel::new(), drop);
+
+    let error = download.result.expect_err("a silent server must fail");
+    assert_eq!(
+        error,
+        "The download stalled — check your connection and try again"
+    );
+    assert!(
+        download.elapsed < Duration::from_secs(5),
+        "{:?}",
+        download.elapsed
+    );
+}
+
+#[test]
+fn cancel_stops_a_stalled_download_without_waiting_for_the_idle_limit() {
+    let server = serve_trickle(Some(4 * 4096), chunks(1, 4096), Duration::ZERO);
+    let cancel = InstallCancel::new();
+    let (cancelled_at, cancelled) = mpsc::channel();
+    let canceller = cancel.clone();
+    let mut requested = false;
+
+    let download = timed_download(
+        &server,
+        short_timeouts(Duration::from_secs(20)),
+        &cancel,
+        move |event| {
+            if !requested
+                && matches!(event, UpdateInstall::Downloading { downloaded, .. } if downloaded > 0)
+            {
+                requested = true;
+                std::thread::sleep(Duration::from_millis(300));
+                let _sent = cancelled_at.send(Instant::now());
+                canceller.cancel();
+            }
+        },
+    );
+
+    let cancelled_at = cancelled.recv().expect("the download made progress first");
+    assert_eq!(download.result, Err("cancelled".to_owned()));
+    let stopped = download.finished.saturating_duration_since(cancelled_at);
+    assert!(stopped < Duration::from_secs(3), "{stopped:?}");
+}
+
+#[test]
+fn cancel_stops_a_silent_metadata_fetch_without_waiting_for_a_timeout() {
+    let server = serve_trickle(None, Vec::new(), Duration::ZERO);
+    let cancel = InstallCancel::new();
+    let canceller = cancel.clone();
+    let cancelled_at = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        canceller.cancel();
+        Instant::now()
+    });
+
+    let result = super::fetch_update_metadata(&server.url, 8192, &cancel);
+
+    let stopped = Instant::now().saturating_duration_since(cancelled_at.join().expect("canceller"));
+    assert!(matches!(result, Err(InstallStop::Cancelled)), "{result:?}");
+    assert!(stopped < Duration::from_secs(3), "{stopped:?}");
+}
+
+#[test]
+fn path_update_install_is_rejected_before_manifest_or_download() {
+    let receiver = super::install_update(
+        request(
+            "v1.0.1",
+            "unused.tar.gz",
+            "https://example.invalid/unused.tar.gz",
+        ),
+        InstallCancel::new(),
+    );
+    assert_eq!(
+        receiver.try_recv(),
+        Ok(UpdateInstall::Failed(
+            crate::services::MANAGED_UPDATES_MESSAGE.into(),
+        ))
+    );
+}

@@ -1,0 +1,7 @@
+Packaging-supplied standard MIT text for poppler-rs and poppler-sys-rs 0.26.0.
+Both crates declare MIT in Cargo.toml but omit the physical license text.
+Attribution follows their Cargo package authors; this is an auxiliary packaging
+notice, not a license file copied from upstream or a change to vendored code.
+Source: https://gitlab.gnome.org/World/Rust/poppler-rs
+Pinned crate VCS revision: dabba607b8987245708a06ee08817f3a6923c20c
+The bundler checks this revision before including the supplement.

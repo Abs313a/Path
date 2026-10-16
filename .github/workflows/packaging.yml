@@ -1,0 +1,41 @@
+name: Packaging
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.*'
+      - 'src/**'
+      - 'data/**'
+      - 'packaging/**'
+      - '.copr/**'
+      - 'Makefile'
+      - '.github/workflows/packaging.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fedora:
+    name: Fedora source package
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    steps:
+      - name: Install source packaging tools
+        run: dnf -y install git cargo rust rpm-build python3 gcc-c++ tar gzip
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Test the package renderer
+        if: ${{ github.event_name != 'push' }}
+        run: python3 -m unittest discover -s scripts -p 'test_update_aur.py'
+      - name: Verify Path branding
+        run: python3 tests/branding_check.py
+      - name: Prepare the pinned offline source RPM
+        run: make -f .copr/Makefile srpm commit="$(git rev-parse HEAD)"
+      - name: Upload source RPM
+        uses: actions/upload-artifact@v7
+        with:
+          name: path-source-rpm
+          path: target/srpm/*.src.rpm

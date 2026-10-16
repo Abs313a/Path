@@ -1,3 +1,0 @@
-module Quickshell.Io
-Socket 1.0 Socket.qml
-SplitParser 1.0 SplitParser.qml

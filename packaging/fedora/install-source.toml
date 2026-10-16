@@ -1,0 +1,4 @@
+manager = "DNF"
+package = "path"
+channel = "stable"
+update_command = "sudo dnf upgrade path"

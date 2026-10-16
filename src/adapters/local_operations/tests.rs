@@ -1,0 +1,570 @@
+// SPDX-License-Identifier: MIT
+
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    error::Error,
+    ffi::{OsStr, OsString},
+    fs,
+    future::Future,
+    io,
+    os::{
+        fd::OwnedFd,
+        unix::{ffi::OsStringExt, fs::PermissionsExt},
+    },
+    path::{Path, PathBuf},
+    pin::Pin,
+    rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
+
+use gtk::{gio, glib, prelude::*};
+
+use crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT;
+
+mod conflicts;
+mod copy;
+mod create_entry;
+mod deletion;
+mod merge;
+mod moves;
+mod naming;
+mod paste_results;
+mod paths;
+mod progress;
+mod replacement;
+mod restore_safety;
+mod sync;
+mod trash_capabilities;
+mod undo;
+
+thread_local! {
+    static COPY_ACTIVITY: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+pub(super) struct CopyActivity;
+
+impl CopyActivity {
+    pub(super) fn start() -> Self {
+        COPY_ACTIVITY.with(|activity| {
+            let (active, peak) = activity.get();
+            activity.set((active + 1, peak.max(active + 1)));
+        });
+        Self
+    }
+}
+
+impl Drop for CopyActivity {
+    fn drop(&mut self) {
+        COPY_ACTIVITY.with(|activity| {
+            let (active, peak) = activity.get();
+            activity.set((active - 1, peak));
+        });
+    }
+}
+
+fn copy_recursively_fat_family(
+    source: gio::File,
+    target: gio::File,
+    overwrite_existing: bool,
+    cancellable: gio::Cancellable,
+    created_root: Option<Rc<super::CreatedCopyRoot>>,
+) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>>>> {
+    copy_recursively_with_progress(
+        source,
+        target,
+        overwrite_existing,
+        cancellable,
+        created_root,
+        None,
+        true,
+    )
+}
+
+use super::{
+    FAT32_MAX_FILE_SIZE, FailedAction, LocalDeleteRoot, LocalFileIdentity, LocalOperationProvider,
+    MergeHooks, MergePlan, MountTable, RestoreEntry, StageCopy, StageOverwrite,
+    StagedOriginalLookup, TRANSFER_PROGRESS_INTERVAL, TransferProgressTracker, TransferStop,
+    await_cancellable, copy_failure_after_cleanup, copy_failure_on_fat32, copy_new_recursively,
+    copy_new_recursively_with_progress, copy_new_remote_file_with, copy_recursively,
+    copy_recursively_with_progress, deletion_error_message, deletion_error_summary,
+    duplicate_candidate_name, fat_sanitized_name, fat32_file_size_limit, home_trash_entries_at,
+    io_error, is_trash_unsupported_failure, join_local_tasks, local_file_identity, merge_local,
+    merge_local_with, move_local, move_local_with, open_local_parent_directory,
+    operation_error_summary, parallel_delete_local, parse_copy_suffix, permanently_delete_local,
+    permanently_delete_local_path_if_unchanged, replace_local, replace_local_with, run_merge_undo,
+    set_force_cross_volume_for_test, set_removable_roots_for_test, set_sync_observer,
+    stop_transfer, sync_probe_observations, target_is_fat_family, transfer_is_noop, transfer_sizes,
+    trash_stage_overwrite, unique_fat_sibling_name, validated_child, was_cancelled,
+};
+use crate::{
+    model::{EntryKind, FileEntry, Location, MetadataValue},
+    services::{
+        DeleteRequest, LoadHandle, MoveRecord, OperationEvent, OperationProvider,
+        OperationRequestId, PasteItem, PasteRequest, RestoreRequest, RestoreSource,
+        RestoreTrashItem, TransferConflict, TrashedOriginal, UndoMoveItem, UndoMoveRequest,
+        UndoRenameRequest,
+    },
+};
+
+struct RemovableFlushGuard;
+
+impl RemovableFlushGuard {
+    fn install(root: &Path, fail: Option<io::ErrorKind>, cross_volume: bool) -> Self {
+        set_removable_roots_for_test(Some(vec![root.to_path_buf()]));
+        set_force_cross_volume_for_test(cross_volume);
+        super::install_sync_probe(fail, false);
+        Self
+    }
+}
+
+impl Drop for RemovableFlushGuard {
+    fn drop(&mut self) {
+        super::release_sync_probe();
+        super::clear_sync_probe();
+        set_sync_observer(None);
+        set_removable_roots_for_test(None);
+        set_force_cross_volume_for_test(false);
+    }
+}
+
+fn terminal_transfer(events: &[OperationEvent]) -> Option<&OperationEvent> {
+    events.iter().rev().find(|event| {
+        matches!(
+            event,
+            OperationEvent::Pasted { .. }
+                | OperationEvent::TransferFailed { .. }
+                | OperationEvent::Cancelled { .. }
+        )
+    })
+}
+
+fn item_moves(events: &[OperationEvent]) -> Vec<(Location, Location)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            OperationEvent::ItemMoved { from, to, .. } => Some((from.clone(), to.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn trashed_items(events: &[OperationEvent]) -> Vec<(Location, TrashedOriginal)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            OperationEvent::ItemTrashed {
+                location, identity, ..
+            } => Some((location.clone(), *identity)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn pump_until_transfer(events: &RefCell<Vec<OperationEvent>>) {
+    let start = Instant::now();
+    while terminal_transfer(&events.borrow()).is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timed out waiting for the transfer to finish: {:?}",
+            events.borrow()
+        );
+        // Own the default context for the whole wait. Releasing it between
+        // polls lets a GIO copy worker run a progress callback inline.
+        glib::MainContext::default().iteration(true);
+    }
+}
+
+fn watch_source_during_sync(source: &Path) -> Arc<std::sync::Mutex<Vec<bool>>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let source = source.to_path_buf();
+    set_sync_observer(Some(Arc::new(move |_| {
+        record
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(source.exists());
+    })));
+    seen
+}
+
+fn file_entry(path: &std::path::Path) -> FileEntry {
+    FileEntry {
+        location: Location::local(path),
+        thumbnail_path: None,
+        native_name: path.file_name().unwrap_or_default().to_owned(),
+        display_name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        kind: EntryKind::File,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+        recent_unix_seconds: MetadataValue::Unknown,
+        is_hidden: false,
+        mode: MetadataValue::Unknown,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
+        recent_uri: None,
+    }
+}
+
+fn directory_entry(path: &std::path::Path) -> FileEntry {
+    FileEntry {
+        kind: EntryKind::Directory,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
+        ..file_entry(path)
+    }
+}
+
+fn settle_cancelled_io(context: &glib::MainContext) {
+    context.block_on(glib::timeout_future(Duration::from_millis(25)));
+    while context.pending() {
+        context.iteration(false);
+    }
+}
+
+fn always_would_recurse() -> super::MoveAttempt {
+    Rc::new(|_, _, _| {
+        Box::pin(async {
+            Err(glib::Error::new(
+                gio::IOErrorEnum::WouldRecurse,
+                "injected cross-filesystem move failure",
+            ))
+        })
+    })
+}
+
+fn wait_for_operation(
+    events: &RefCell<Vec<OperationEvent>>,
+    is_terminal: impl Fn(&OperationEvent) -> bool,
+) {
+    while !events.borrow().iter().any(&is_terminal) {
+        glib::MainContext::default().iteration(true);
+    }
+}
+
+fn wait_for_restore(events: &Rc<RefCell<Vec<OperationEvent>>>) {
+    wait_for_operation(events, |event| {
+        matches!(
+            event,
+            OperationEvent::Restored { .. }
+                | OperationEvent::RestoreCompletedWithErrors { .. }
+                | OperationEvent::Failed { .. }
+                | OperationEvent::Cancelled { .. }
+        )
+    });
+}
+
+fn volume_trash_entry(
+    root: &Path,
+    name: &str,
+    orig_path: &str,
+    contents: &[u8],
+) -> Result<(PathBuf, FileEntry), Box<dyn Error>> {
+    let uid = rustix::process::getuid().as_raw();
+    let trash = root.join(format!(".Trash-{uid}"));
+    fs::create_dir_all(trash.join("files"))?;
+    fs::create_dir_all(trash.join("info"))?;
+    let source = trash.join("files").join(name);
+    fs::write(&source, contents)?;
+    fs::write(
+        trash.join("info").join(format!("{name}.trashinfo")),
+        format!("[Trash Info]\nPath={orig_path}\nDeletionDate=2026-01-01T00:00:00\n"),
+    )?;
+    Ok((source.clone(), file_entry(&source)))
+}
+
+fn drive_until_transfer_settles(events: &Rc<RefCell<Vec<OperationEvent>>>) {
+    wait_for_operation(events, |event| {
+        matches!(
+            event,
+            OperationEvent::Pasted { .. }
+                | OperationEvent::TransferFailed { .. }
+                | OperationEvent::Cancelled { .. }
+        )
+    });
+}
+
+fn run_paste_collecting_created(
+    request: PasteRequest,
+) -> Result<Vec<Option<Location>>, Box<dyn Error>> {
+    let created = run_paste(request)
+        .iter()
+        .filter_map(|event| match event {
+            OperationEvent::TransferProgress {
+                created_location, ..
+            } => Some(created_location.clone()),
+            _ => None,
+        })
+        .collect();
+    Ok(created)
+}
+
+fn run_paste(request: PasteRequest) -> Vec<OperationEvent> {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let emitted = events.clone();
+    let _operation = LocalOperationProvider.paste(
+        request,
+        Rc::new(move |event| emitted.borrow_mut().push(event)),
+    );
+
+    wait_for_operation(&events, |event| {
+        matches!(
+            event,
+            OperationEvent::Pasted { .. } | OperationEvent::TransferFailed { .. }
+        )
+    });
+
+    assert!(matches!(
+        events.borrow().last(),
+        Some(OperationEvent::Pasted { .. })
+    ));
+    events.take()
+}
+
+fn sequential_delete_local(
+    parent: OwnedFd,
+    name: OsString,
+) -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
+    Box::pin(async move {
+        let step_parent = parent.try_clone().map_err(|error| error.to_string())?;
+        let step_name = name.clone();
+        let step = super::run_local_delete_step(move || {
+            super::open_local_delete_target(&step_parent, &step_name, None)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        let super::LocalDeleteStep::Directory { handle, children } = step else {
+            return Ok(());
+        };
+        for child in children {
+            let checked_parent = parent.try_clone().map_err(|error| error.to_string())?;
+            let checked_handle = handle.try_clone().map_err(|error| error.to_string())?;
+            let checked_name = name.clone();
+            super::run_local_delete_step(move || {
+                super::ensure_local_delete_target_unchanged(
+                    &checked_parent,
+                    &checked_name,
+                    &checked_handle,
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            sequential_delete_local(
+                handle.try_clone().map_err(|error| error.to_string())?,
+                child,
+            )
+            .await?;
+        }
+        super::run_local_delete_step(move || {
+            super::ensure_local_delete_target_unchanged(&parent, &name, &handle)?;
+            rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())
+    })
+}
+
+fn sync_delete_benchmark_filesystem(root: &Path) -> Result<(), Box<dyn Error>> {
+    let handle = rustix::fs::open(
+        root,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    rustix::fs::syncfs(handle)?;
+    Ok(())
+}
+
+fn create_delete_benchmark_tree(root: &Path, count: usize) -> io::Result<()> {
+    const DIRECTORIES: usize = 256;
+    fs::create_dir(root)?;
+    for directory in 0..DIRECTORIES.min(count.max(1)) {
+        fs::create_dir(root.join(format!("dir-{directory}")))?;
+    }
+    for index in 0..count {
+        fs::File::create(
+            root.join(format!("dir-{}", index % DIRECTORIES))
+                .join(format!("item-{index}")),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual performance benchmark; run scripts/benchmark-delete.sh"]
+fn benchmark_delete_large_directory() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let count = std::env::var("PATHFM_DELETE_BENCH_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100_000);
+    let benchmark_root = std::env::var_os("PATHFM_DELETE_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?.join("target/delete-benchmark"));
+    fs::create_dir_all(&benchmark_root)?;
+    let serial_root = benchmark_root.join(format!("serial-{unique}"));
+    let available_workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1);
+    let mut worker_counts = vec![1, 2, 4, available_workers];
+    worker_counts.sort_unstable();
+    worker_counts.dedup();
+    worker_counts.retain(|workers| *workers <= available_workers);
+    let worker_roots = worker_counts
+        .iter()
+        .map(|workers| {
+            (
+                *workers,
+                benchmark_root.join(format!("workers-{workers}-{unique}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    create_delete_benchmark_tree(&serial_root, count)?;
+    for (_, root) in &worker_roots {
+        create_delete_benchmark_tree(root, count)?;
+    }
+    sync_delete_benchmark_filesystem(&benchmark_root)?;
+    let context = glib::MainContext::default();
+
+    let serial_parent = super::open_local_parent_directory(
+        serial_root.parent().ok_or("benchmark root has no parent")?,
+    )?;
+    let serial_name = serial_root
+        .file_name()
+        .ok_or("benchmark root has no name")?
+        .to_owned();
+    let serial_started = Instant::now();
+    context
+        .block_on(sequential_delete_local(serial_parent, serial_name))
+        .map_err(io::Error::other)?;
+    let serial_elapsed = serial_started.elapsed();
+    sync_delete_benchmark_filesystem(&benchmark_root)?;
+
+    let mut measurements = Vec::new();
+    let mut detected_workers = None;
+    for (workers, root) in &worker_roots {
+        let parent = super::open_local_parent_directory(
+            root.parent().ok_or("benchmark root has no parent")?,
+        )?;
+        let name = root
+            .file_name()
+            .ok_or("benchmark root has no name")?
+            .to_owned();
+        let target_root = super::LocalDeleteRoot {
+            parent: Arc::new(parent),
+            name,
+            expected: None,
+        };
+        detected_workers = Some(super::local_delete_worker_count(std::slice::from_ref(
+            &target_root,
+        )));
+        let parallel_started = Instant::now();
+        super::parallel_delete_local_blocking_with_workers(
+            vec![target_root],
+            Arc::new(AtomicBool::new(false)),
+            *workers,
+        )
+        .map_err(io::Error::other)?;
+        let parallel_elapsed = parallel_started.elapsed();
+        measurements.push((*workers, parallel_elapsed));
+        sync_delete_benchmark_filesystem(&benchmark_root)?;
+    }
+    let production_workers = detected_workers.unwrap_or(1);
+    let (_, production_elapsed) = measurements
+        .iter()
+        .find(|measurement| measurement.0 == production_workers)
+        .copied()
+        .ok_or("missing production worker measurement")?;
+    let single_elapsed = measurements
+        .iter()
+        .find(|measurement| measurement.0 == 1)
+        .map(|measurement| measurement.1)
+        .ok_or("missing single-worker measurement")?;
+
+    println!("files: {count}; production workers: {production_workers}");
+    println!(
+        "legacy sequential: {:.3}s ({:.0} files/s)",
+        serial_elapsed.as_secs_f64(),
+        count as f64 / serial_elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    for (workers, elapsed) in &measurements {
+        println!(
+            "workers={workers}: elapsed={:.3}s ({:.0} files/s)",
+            elapsed.as_secs_f64(),
+            count as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+    println!(
+        "production parallel speedup: {:.2}x; end-to-end speedup: {:.2}x",
+        single_elapsed.as_secs_f64() / production_elapsed.as_secs_f64().max(f64::EPSILON),
+        serial_elapsed.as_secs_f64() / production_elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    assert!(!serial_root.exists());
+    assert!(worker_roots.iter().all(|(_, root)| !root.exists()));
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual scale benchmark; run PATHFM_DELETE_BENCH_SCALE=1 scripts/benchmark-delete.sh"]
+fn benchmark_parallel_delete_scale() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let count = std::env::var("PATHFM_DELETE_BENCH_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000_000);
+    let benchmark_root = std::env::var_os("PATHFM_DELETE_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?.join("target/delete-benchmark"));
+    fs::create_dir_all(&benchmark_root)?;
+    let root = benchmark_root.join(format!("scale-{unique}"));
+    create_delete_benchmark_tree(&root, count)?;
+    sync_delete_benchmark_filesystem(&benchmark_root)?;
+
+    let parent =
+        super::open_local_parent_directory(root.parent().ok_or("benchmark root has no parent")?)?;
+    let name = root
+        .file_name()
+        .ok_or("benchmark root has no name")?
+        .to_owned();
+    let target_root = super::LocalDeleteRoot {
+        parent: Arc::new(parent),
+        name,
+        expected: None,
+    };
+    let workers = super::local_delete_worker_count(std::slice::from_ref(&target_root));
+    let cleanup_started = Instant::now();
+    super::parallel_delete_local_blocking_with_workers(
+        vec![target_root],
+        Arc::new(AtomicBool::new(false)),
+        workers,
+    )
+    .map_err(io::Error::other)?;
+    let cleanup_elapsed = cleanup_started.elapsed();
+
+    println!(
+        "files={count} workers={workers} elapsed={:.3}s ({:.0} files/s)",
+        cleanup_elapsed.as_secs_f64(),
+        count as f64 / cleanup_elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    assert!(!root.exists());
+    Ok(())
+}

@@ -8,6 +8,12 @@ import re
 import shutil
 
 SUPPLEMENTS = {
+    ("poppler-rs", "0.26.0"): ("dabba607b8987245708a06ee08817f3a6923c20c", "poppler-rs-0.26.0"),
+    ("poppler-sys-rs", "0.26.0"): ("dabba607b8987245708a06ee08817f3a6923c20c", "poppler-rs-0.26.0"),
+    ('docx-rs', '0.4.22'): ('f04cf8b47a925b2b6fff850dcb75069aae89dab4', 'docx-rs-0.4.22'),
+    ('rquickjs-core', '0.13.0'): ('f3039c8d931417049ce6133b3ff4550ca38438a5', 'rquickjs-0.13.0'),
+    ('rust-i18n-macro', '4.2.4'): ('5f3ea5ba03395f2f2908e3587e01788cfdfd3555', 'rust-i18n-4.2.4'),
+    ('rust-i18n-support', '4.2.4'): ('5f3ea5ba03395f2f2908e3587e01788cfdfd3555', 'rust-i18n-4.2.4'),
     ("russh-cryptovec", "0.62.0"): ("907c732562c5732aad6c140dba958eafddc41ba0", "russh-cryptovec-0.62.0"),
     ("russh", "0.64.1"): ("e5d80a07dc554480b6ea3b2e14adfc190407b627", "russh-0.64.1"),
     ("delegate", "0.13.5"): ("b129d4cbf4cc499eff7743365dcb0fe5d8d2e820", "delegate"),
@@ -27,6 +33,9 @@ KNOWN = {
     "Apache-2.0 OR ISC OR MIT", "Apache-2.0 WITH LLVM-exception",
     "(MIT OR Apache-2.0) AND Unicode-3.0", "BSD-2-Clause OR Apache-2.0 OR MIT",
     "MIT OR Apache-2.0 OR Zlib",
+    "(Apache-2.0 OR MIT) AND BSD-3-Clause", "Apache-2.0 OR BSD-3-Clause",
+    "Apache-2.0 OR BSL-1.0", "BSD-2-Clause", "CC0-1.0 OR MIT-0",
+    "CC0-1.0 OR MIT-0 OR Apache-2.0", "Unicode-3.0", "bzip2-1.0.6",
 }
 
 

@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: MIT
+
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+use gio::glib;
+
+use super::{Browser, BrowserEvent, RequestId, SelectionUpdate};
+
+/// Rows exposed immediately; larger publications continue within idle budgets.
+const FIRST_PUBLISH_COUNT: usize = 128;
+const STAGE_INLINE_LIMIT: usize = 512;
+const INITIAL_PUBLISH_CHUNK: usize = 512;
+const MIN_PUBLISH_CHUNK: usize = 128;
+const MAX_PUBLISH_CHUNK: usize = 2048;
+const PUBLISH_CHUNK_BUDGET: Duration = Duration::from_millis(12);
+const PUBLISH_SLICE_BUDGET: Duration = Duration::from_millis(8);
+
+pub(super) enum PublishTerminal {
+    LoadFinished {
+        truncated: bool,
+        retry_metadata: bool,
+    },
+    SortingFinished,
+}
+
+pub(super) struct PublicationPlan {
+    pub(super) request_id: RequestId,
+    pub(super) total: usize,
+    pub(super) focused: Option<usize>,
+    pub(super) positions: Vec<usize>,
+    pub(super) take_focus: bool,
+    pub(super) terminal: PublishTerminal,
+}
+
+/// Progress is separate from the captured selection and terminal payload.
+pub(super) struct StagedPublish {
+    plan: PublicationPlan,
+    published: usize,
+    chunk_size: usize,
+    measured_chunks: usize,
+}
+
+impl StagedPublish {
+    fn finishes_sorting(&self) -> bool {
+        matches!(self.plan.terminal, PublishTerminal::SortingFinished)
+    }
+
+    fn next_chunk(&self, available: usize) -> (usize, usize) {
+        let end = (self.published + self.chunk_size)
+            .min(available)
+            .min(self.plan.total);
+        (self.published, end.saturating_sub(self.published))
+    }
+}
+
+fn adjusted_chunk_size(current: usize, elapsed: Duration) -> usize {
+    if elapsed > PUBLISH_CHUNK_BUDGET {
+        (current / 2).max(MIN_PUBLISH_CHUNK)
+    } else if elapsed < PUBLISH_CHUNK_BUDGET / 2 {
+        current.saturating_mul(2).min(MAX_PUBLISH_CHUNK)
+    } else {
+        current
+    }
+}
+
+impl Browser {
+    pub(super) fn publish_staged(self: &Rc<Self>, depth: usize, plan: PublicationPlan) {
+        self.drain_publish(depth);
+        if self.preserving_refreshes.borrow_mut().remove(&depth) {
+            if self.state.borrow().columns.get(depth).is_none() {
+                return;
+            }
+            self.emit(BrowserEvent::EntriesReplaced {
+                depth,
+                count: plan.total,
+            });
+            self.complete_publication(depth, plan);
+            return;
+        }
+        if plan.total <= STAGE_INLINE_LIMIT {
+            if self.state.borrow().columns.get(depth).is_none() {
+                return;
+            }
+            self.emit(BrowserEvent::EntriesReplaced {
+                depth,
+                count: plan.total,
+            });
+            self.complete_publication(depth, plan);
+            return;
+        }
+        let published = self
+            .state
+            .borrow()
+            .columns
+            .get(depth)
+            .map_or(0, |column| column.entries.len().min(FIRST_PUBLISH_COUNT));
+        self.emit(BrowserEvent::EntriesReplaced {
+            depth,
+            count: published,
+        });
+        self.staged_publishes.borrow_mut().insert(
+            depth,
+            StagedPublish {
+                plan,
+                published,
+                chunk_size: INITIAL_PUBLISH_CHUNK,
+                measured_chunks: 0,
+            },
+        );
+        self.arm_publish_timer();
+    }
+
+    fn complete_publication(self: &Rc<Self>, depth: usize, plan: PublicationPlan) {
+        tracing::debug!(
+            depth,
+            entries = plan.total,
+            "directory publication finished"
+        );
+        if let Some(focused) = plan.focused {
+            self.emit(BrowserEvent::SelectionSetChanged {
+                depth,
+                selection: SelectionUpdate::Positions(plan.positions),
+                focused,
+                take_focus: plan.take_focus,
+            });
+        }
+        match plan.terminal {
+            PublishTerminal::LoadFinished {
+                truncated,
+                retry_metadata,
+            } => {
+                self.emit(BrowserEvent::LoadFinished { depth, truncated });
+                self.report_unresolved_location_reveal(depth, plan.request_id);
+                if retry_metadata {
+                    self.ensure_sorted_after_load(depth);
+                }
+            }
+            PublishTerminal::SortingFinished => self.finish_sorting(depth),
+        }
+    }
+
+    /// Converge with the authoritative model before mutations that assume all
+    /// rows are visible; unlike an idle tail, draining is not chunk-limited.
+    pub(super) fn drain_publish(self: &Rc<Self>, depth: usize) {
+        let staged = self.staged_publishes.borrow_mut().remove(&depth);
+        let Some(staged) = staged else {
+            return;
+        };
+        let remainder = self.state.borrow().columns.get(depth).map_or(0, |column| {
+            column.entries.len().saturating_sub(staged.published)
+        });
+        if remainder > 0 {
+            self.emit(BrowserEvent::EntriesPublished {
+                depth,
+                position: staged.published,
+                count: remainder,
+            });
+        }
+        self.complete_publication(depth, staged.plan);
+    }
+
+    pub(super) fn publishing_sort(&self, depth: usize) -> bool {
+        self.staged_publishes
+            .borrow()
+            .get(&depth)
+            .is_some_and(StagedPublish::finishes_sorting)
+    }
+
+    /// An applied sort finishes when its rows publish, so dropping them
+    /// before the last ends the sort.
+    pub(super) fn drop_staged_publish(&self, depth: usize) {
+        let staged = self.staged_publishes.borrow_mut().remove(&depth);
+        if staged.as_ref().is_some_and(StagedPublish::finishes_sorting)
+            && self.pending_sort_applied.get()
+            && self
+                .pending_sort
+                .get()
+                .is_some_and(|(_, pending_depth)| pending_depth == depth)
+        {
+            self.pending_sort.set(None);
+            self.finish_sorting(depth);
+        }
+    }
+
+    pub(super) fn cancel_publish(&self, depth: usize) {
+        self.drop_staged_publish(depth);
+        self.preserving_refreshes.borrow_mut().remove(&depth);
+        if self.staged_publishes.borrow().is_empty()
+            && let Some(source) = self.publish_timer.borrow_mut().take()
+        {
+            source.remove();
+        }
+    }
+
+    fn arm_publish_timer(self: &Rc<Self>) {
+        if self.publish_timer.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        // Run after GDK redraw (priority 120), but before default idle (200):
+        // frames stay smooth without letting continuous frame work starve tails.
+        let source = glib::idle_add_local_full(glib::Priority::from(130), move || {
+            if let Some(browser) = weak.upgrade() {
+                browser.fire_publish_tails();
+            }
+            glib::ControlFlow::Break
+        });
+        *self.publish_timer.borrow_mut() = Some(source);
+    }
+
+    fn fire_publish_tails(self: &Rc<Self>) {
+        self.publish_timer.borrow_mut().take();
+        let started = Instant::now();
+        loop {
+            let depth = self.staged_publishes.borrow().keys().copied().next();
+            let Some(depth) = depth else {
+                return;
+            };
+            if self.discard_stale_publication(depth) {
+                continue;
+            }
+            if started.elapsed() >= PUBLISH_SLICE_BUDGET {
+                self.arm_publish_timer();
+                return;
+            }
+            self.publish_next_chunk(depth);
+        }
+    }
+
+    fn discard_stale_publication(&self, depth: usize) -> bool {
+        let current = self
+            .staged_publishes
+            .borrow()
+            .get(&depth)
+            .map(|staged| staged.plan.request_id);
+        let stale =
+            current.is_some_and(|id| self.state.borrow().request_id_for_depth(depth) != Some(id));
+        if stale {
+            self.drop_staged_publish(depth);
+        }
+        stale
+    }
+
+    fn next_publication_chunk(&self, depth: usize) -> Option<(usize, usize)> {
+        self.staged_publishes
+            .borrow()
+            .get(&depth)
+            .and_then(|staged| {
+                self.state
+                    .borrow()
+                    .columns
+                    .get(depth)
+                    .map(|column| staged.next_chunk(column.entries.len()))
+            })
+    }
+
+    fn publish_next_chunk(self: &Rc<Self>, depth: usize) {
+        match self.next_publication_chunk(depth) {
+            None => self.drop_staged_publish(depth),
+            Some((_, 0)) => {
+                let staged = self.staged_publishes.borrow_mut().remove(&depth);
+                if let Some(staged) = staged {
+                    self.complete_publication(depth, staged.plan);
+                }
+            }
+            Some((position, count)) => {
+                let started = Instant::now();
+                self.emit(BrowserEvent::EntriesPublished {
+                    depth,
+                    position,
+                    count,
+                });
+                let elapsed = started.elapsed();
+                if let Some(staged) = self.staged_publishes.borrow_mut().get_mut(&depth) {
+                    staged.published += count;
+                    if staged.measured_chunks > 0 {
+                        staged.chunk_size = adjusted_chunk_size(staged.chunk_size, elapsed);
+                    }
+                    staged.measured_chunks += 1;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

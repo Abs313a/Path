@@ -1,152 +1,598 @@
 name: Release
 
-# Run by hand, from the Actions tab. Takes the packages the newest green CI run on main built,
-# drives the x86_64 one under a compositor, then tags the commit
-# those packages were built from and publishes them. Nothing is built here: what is released is
-# byte for byte what CI tested. The version is the code's — `pkgver` in that commit's PKGBUILD —
-# and a version already tagged is refused, so releasing is: bump `pkgver` (and the workspace
-# version), push, wait for green, run this.
 on:
   workflow_dispatch:
     inputs:
-      publish:
-        description: 'Tag and publish. Off: just drive the package and stop.'
-        type: boolean
-        default: true
+      bump:
+        description: Version component to increment
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      mode:
+        description: Release channel to publish
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - alpha
+          - beta
+          - rc
+          - nightly
+      source:
+        description: PR number, branch, tag, or commit to publish (prereleases only; blank uses main)
+        required: false
+        type: string
 
-# The token needs to read Actions: `gh run list` and pulling another run's artifacts both go
-# through that API, and the repository's default token has contents only.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
-  actions: read
   contents: read
 
+env:
+  RELEASE_RUST_VERSION: 1.98.0
+
 jobs:
-  pick:
-    name: Pick the CI run
-    runs-on: ubuntu-latest
+  prepare:
+    name: Determine release version
+    # Organization-owned repositories expose the organization, not a human owner.
+    if: github.actor == vars.RELEASE_ACTOR
+    runs-on: ubuntu-24.04
     outputs:
-      run_id: ${{ steps.pick.outputs.run_id }}
-      sha: ${{ steps.pick.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
+      source_sha: ${{ steps.source.outputs.sha }}
+      checkout_ref: ${{ steps.source.outputs.checkout_ref }}
+
     steps:
-      - id: pick
+      - name: Require the default branch
         env:
-          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
-          [ -n "$run" ] || { echo "no successful CI run on main to release"; exit 1; }
-          sha="$(gh run view --repo "$GITHUB_REPOSITORY" "$run" --json headSha --jq .headSha)"
-          # The newest green run is not the newest run when main has moved and its CI is still
-          # going, or went red: releasing then quietly ships the commit before the fix. Say so and
-          # stop. (A commit CI skips, docs only, starts no run, so it cannot trip this.)
-          newest="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push --branch main --limit 1 --json databaseId,headSha,status,conclusion --jq '.[0]')"
-          newest_id="$(jq -r .databaseId <<<"$newest")"
-          if [ "$newest_id" != "$run" ]; then
-            echo "the newest CI run on main is $(jq -r .headSha <<<"$newest") ($(jq -r '.status + (if .conclusion then " / " + .conclusion else "" end)' <<<"$newest")), not the newest green one ($sha)."
-            echo "Wait for it to pass, or fix it, before releasing."
+          if [[ "$BRANCH" != "$DEFAULT_BRANCH" ]]; then
+            echo "Releases must be run from $DEFAULT_BRANCH (selected: $BRANCH)." >&2
             exit 1
           fi
-          echo "run_id=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve source commit
+        id: source
+        env:
+          MODE: ${{ inputs.mode }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          if [[ "$MODE" == "stable" && -n "$SOURCE" ]]; then
+            echo "Stable releases must use the current default-branch tip." >&2
+            exit 1
+          fi
+
+          if [[ -z "$SOURCE" ]]; then
+            sha="$(git rev-parse HEAD)"
+            checkout_ref="$sha"
+          elif [[ "$SOURCE" =~ ^[0-9]+$ ]]; then
+            checkout_ref="refs/pull/${SOURCE}/head"
+            git fetch --no-tags origin "$checkout_ref"
+            sha="$(git rev-parse FETCH_HEAD)"
+          else
+            git fetch --no-tags origin "$SOURCE"
+            sha="$(git rev-parse FETCH_HEAD)"
+            checkout_ref="$sha"
+          fi
+
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ steps.pick.outputs.sha }}
-          fetch-tags: true
-      - id: version
-        name: The version is the code's, and not one already released
+          echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          MODE: ${{ inputs.mode }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
-          version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
-          [ -n "$version" ] || { echo "no pkgver in packaging/PKGBUILD"; exit 1; }
-          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            echo "v$version is already a tag: bump pkgver in packaging/PKGBUILD (and the workspace version) and push first"
-            exit 1
-          fi
+          current_version="$(git show "$SOURCE_SHA:Cargo.toml" | grep -m1 -oP '^version = "\K\d+\.\d+\.\d+(?=")')"
+          tags="$(git tag -l 'v*')"
+          version="$(python3 scripts/release_version.py \
+            --current-version "$current_version" \
+            --bump "$BUMP" \
+            --mode "$MODE" \
+            --date "$(date --utc +%Y%m%d)" \
+            --tags "$tags")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "releasing CI run ${{ steps.pick.outputs.run_id }}, commit ${{ steps.pick.outputs.sha }}, as v$version"
 
-  # The package, installed and used: the daemon and the shell it ships, driven under a headless
-  # compositor through twenty-five flows (tests/e2e), from the commit the package was built at.
-  # x86_64 only for now.
-  drive:
-    name: Install the package and drive it (x86_64, under cage)
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:latest
-      options: --privileged
-    needs: pick
+      - name: Guard against superseding an untested RC
+        if: inputs.mode == 'stable'
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # VERSION is the plain core version for a stable release. If an RC
+          # already exists for this core version, a stable release must not
+          # silently supersede it unless the RC's commit is already part of
+          # this release's history -- otherwise a stable tag could publish
+          # over an RC whose changes were never folded in and never tested
+          # as stable.
+          for tag in $(git tag -l "v${VERSION}-rc.*"); do
+            if ! git merge-base --is-ancestor "$tag" "$SOURCE_SHA"; then
+              echo "Tag $tag targets a commit not reachable from $SOURCE_SHA (the release source). A stable release must not silently supersede an untested RC." >&2
+              exit 1
+            fi
+          done
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
     steps:
-      - name: Install runtime
-        run: |
-          sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && pacman -Syu --noconfirm --needed git sudo cage wtype grim dbus \
-            xdg-desktop-portal gnome-keyring openssh vsftpd ffmpeg python nodejs npm \
-            qt6-base qt6-declarative quickshell samba gvfs-smb
-          useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
-      - uses: actions/checkout@v7
+      - name: Check out source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.pick.outputs.sha }}
-      - uses: actions/download-artifact@v8
-        with:
-          name: path-package-x86_64
-          path: pkg
-          run-id: ${{ needs.pick.outputs.run_id }}
-          github-token: ${{ github.token }}
-      - name: The package carries the version
-        run: ls "pkg/path-${{ needs.pick.outputs.version }}-1-x86_64.pkg.tar.zst" || { echo "CI run ${{ needs.pick.outputs.run_id }} built:"; ls pkg; echo "not ${{ needs.pick.outputs.version }}, the pkgver of its own commit — that should not happen"; exit 1; }
-      - name: Install the package
-        run: pacman -U --noconfirm --overwrite '*' pkg/path-*.pkg.tar.zst
-      - name: Run the flows under cage
-        # No build tree here on purpose: the harness falls back to the installed path, so what
-        # runs is the package. Flows that need something this image does not have — a pointer
-        # that the compositor can map to an output — skip by name and say so.
-        run: |
-          chown -R builder .
-          sudo -u builder bash -c 'tests/e2e/run.sh'
-      - name: Show the logs
-        if: always()
-        run: tail -n 40 tests/e2e/out/*.log || true
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: e2e-diffs
-          path: tests/e2e/out/**
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          persist-credentials: false
 
-  publish:
-    name: Tag and publish
-    runs-on: ubuntu-latest
-    needs: [pick, drive]
-    if: inputs.publish
-    # A job's own `permissions` replaces the workflow's, so the read is repeated here.
+      - name: Verify source commit
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Set release version
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [[ "$MODE" != "stable" ]]; then
+            # Fail closed when targeting source older than release-channel
+            # support; otherwise the archive tag and binary identity diverge.
+            if ! grep -q 'PATHFM_RELEASE_TAG' build.rs; then
+              echo "The selected source does not support prerelease build metadata." >&2
+              exit 1
+            fi
+
+            # Prerelease identity is injected at build time instead of being
+            # written into Cargo.toml, which remains the stable version line.
+            {
+              echo "PATHFM_RELEASE_TAG=v${VERSION}"
+              echo "PATHFM_BUILD_KIND=${MODE}"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+          manifest_path = pathlib.Path("Cargo.toml")
+          manifest = manifest_path.read_text()
+          manifest, count = re.subn(
+              r'(^version = ")\d+\.\d+\.\d+("$)',
+              rf'\g<1>{version}\2',
+              manifest,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("could not update Cargo.toml package version")
+          manifest_path.write_text(manifest)
+
+          lock_path = pathlib.Path("Cargo.lock")
+          lock = lock_path.read_text()
+          lock, count = re.subn(
+              r'(\[\[package\]\]\nname = "pathfm"\nversion = ")\d+\.\d+\.\d+("\n)',
+              rf'\g<1>{version}\2',
+              lock,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("could not update the pathfm version in Cargo.lock")
+          lock_path.write_text(lock)
+          PY
+
+      - name: Install native development libraries
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update
+          sudo apt-get install --yes libfontconfig1-dev libgtk-4-dev libgtksourceview-5-dev libpoppler-glib-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.RELEASE_RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package binary
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          package="pathfm-${VERSION}-${TARGET}"
+          mkdir -p "dist/$package"
+          install -m 755 "target/$TARGET/release/pathfm" "dist/$package/pathfm"
+          objcopy --only-keep-debug --compress-debug-sections=zlib "dist/$package/pathfm" "dist/$package.debug"
+          strip --strip-unneeded "dist/$package/pathfm"
+          objcopy --add-gnu-debuglink="dist/$package.debug" "dist/$package/pathfm"
+          printf '%s\n' "$SOURCE_SHA" > "dist/$package/SOURCE_COMMIT"
+          cp README.md LICENSE THIRD_PARTY_LICENSES.md data/licenses/UnRAR.txt "dist/$package/"
+          mkdir -p "dist/$package/docs" "dist/$package/portal"
+          cp docs/portal-file-chooser.md "dist/$package/docs/"
+          cp data/portal/* "dist/$package/portal/"
+          mkdir -p "dist/$package/udiskie"
+          cp data/udiskie/* "dist/$package/udiskie/"
+          install -m 644 data/pathfm.desktop "dist/$package/"
+          install -m 644 data/io.github.christitustech.Path.FileManager1.service "dist/$package/"
+          install -m 644 data/icons/512x512/apps/io.github.christitustech.Path.png "dist/$package/"
+          tar --format=ustar -C dist -czf "dist/$package.tar.gz" "$package"
+          (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+          (cd dist && sha256sum "$package.debug" > "$package.debug.sha256")
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pathfm-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.debug
+            dist/*.sha256
+          if-no-files-found: error
+
+  sign:
+    name: Sign update manifest
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    environment: release-signing
     permissions:
-      actions: read
-      contents: write
+      contents: read
+
     steps:
-      - uses: actions/download-artifact@v8
+      - name: Check out trusted signing tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          pattern: path-package-*
+          # Never execute signing tools from the selected prerelease source.
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: pathfm-*
           path: dist
           merge-multiple: true
-          run-id: ${{ needs.pick.outputs.run_id }}
-          github-token: ${{ github.token }}
-      - name: Both architectures, both checksums
-        run: |
-          cd dist && ls -l
-          for a in x86_64 aarch64; do
-            f="path-${{ needs.pick.outputs.version }}-1-$a.pkg.tar.zst"
-            [ -f "$f" ] && [ -f "$f.sha256" ] || { echo "missing $f or its checksum"; exit 1; }
-            sha256sum -c "$f.sha256"
-          done
-      - uses: softprops/action-gh-release@v3
+
+      - name: Sign release identity and archive digests
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_SIGNING_KEY_NEXT: ${{ secrets.UPDATE_SIGNING_KEY_NEXT }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: >-
+          python3 scripts/sign_update_manifest.py
+          --directory dist --version "$VERSION" --source-commit "$SOURCE_SHA"
+
+      - name: Upload signed manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: v${{ needs.pick.outputs.version }}
-          target_commitish: ${{ needs.pick.outputs.sha }}
-          files: dist/*
-          generate_release_notes: true
-          body: |
-            Install or upgrade on Arch / Omarchy by downloading the package for your
-            architecture below and running `sudo pacman -U <package>`.
+          name: signed-update-manifest
+          path: |
+            dist/pathfm-update-manifest.json
+            dist/pathfm-update-manifest.signatures.json
+          if-no-files-found: error
 
-            Source build instructions: https://github.com/ChrisTitusTech/Path#installation
+  release:
+    name: Tag and publish release
+    needs: [prepare, build, sign]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
 
-            Public COPR distribution remains on hold. Fedora 43 installation validation
-            is blocked by the unavailable Quickshell dependency. See the security review
-            in docs/security-review-2026-10-14.md for remaining dependency advisories.
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - name: Verify source commit
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Commit version and push tag
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+          MODE: ${{ inputs.mode }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ "$MODE" != "stable" ]]; then
+            # A prerelease run tags the source commit but never pushes a
+            # version-bump commit to the default branch.
+            git fetch origin --tags
+            if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+              echo "Tag v$VERSION already exists." >&2
+              exit 1
+            fi
+
+            git tag -a "v$VERSION" -m "Path v$VERSION"
+            git push origin "v$VERSION"
+            exit 0
+          fi
+
+          git fetch origin "$BRANCH" --tags
+          if [[ "$(git rev-parse "origin/$BRANCH")" != "$SOURCE_SHA" ]]; then
+            echo "The default branch changed while release binaries were building. Run the workflow again." >&2
+            exit 1
+          fi
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists." >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+          for filename, pattern in (
+              ("Cargo.toml", r'(^version = ")\d+\.\d+\.\d+("$)'),
+              ("Cargo.lock", r'(\[\[package\]\]\nname = "pathfm"\nversion = ")\d+\.\d+\.\d+("\n)'),
+          ):
+              path = pathlib.Path(filename)
+              text, count = re.subn(pattern, rf'\g<1>{version}\2', path.read_text(), count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"could not update version in {filename}")
+              path.write_text(text)
+          PY
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release v$VERSION"
+          git tag -a "v$VERSION" -m "Path v$VERSION"
+          git push --atomic origin "HEAD:$BRANCH" "v$VERSION"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [[ "$MODE" != "stable" ]]; then
+            # --prerelease keeps /releases/latest pointing at the last final
+            # release, which is the endpoint a Stable user polls.
+            gh release create "v$VERSION" dist/* --verify-tag --generate-notes --prerelease --title "Path v$VERSION"
+          else
+            gh release create "v$VERSION" dist/* --verify-tag --generate-notes --title "Path v$VERSION"
+          fi
+
+  announce:
+    name: Announce release on Discord
+    needs: [prepare, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Publish Discord announcement
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_TRIAGE_BOT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          version = os.environ["VERSION"]
+          mode = os.environ["MODE"]
+          tag = f"v{version}"
+          release_api = f"https://api.github.com/repos/{repository}/releases/tags/{tag}"
+          request = urllib.request.Request(
+              release_api,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "User-Agent": "pathfm-release-workflow",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request) as response:
+              release = json.load(response)
+
+          if mode == "stable":
+              channel = "Stable"
+              color = 0x9ECE6A
+          elif mode == "rc":
+              channel = "Release Candidate"
+              color = 0xE0AF68
+          else:
+              channel = f"Preview · {mode.title()}"
+              color = 0x7AA2F7
+
+          notes = (release.get("body") or "See GitHub for release notes.").strip()
+          if len(notes) > 3000:
+              notes = notes[:2997].rstrip() + "..."
+          announcement = {
+              "allowed_mentions": {"parse": []},
+              "embeds": [
+                  {
+                      "title": f"Path {tag} is available",
+                      "url": release["html_url"],
+                      "description": notes,
+                      "color": color,
+                      "fields": [
+                          {"name": "Channel", "value": channel, "inline": True},
+                          {"name": "Version", "value": tag, "inline": True},
+                      ],
+                      "footer": {"text": "Path · Navigate every layer."},
+                  }
+              ],
+          }
+
+          def post(channel_id, payload):
+              request = urllib.request.Request(
+                  f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bot {os.environ['DISCORD_BOT_TOKEN']}",
+                      "Content-Type": "application/json",
+                      "User-Agent": "pathfm-release-workflow",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request) as response:
+                  return json.load(response)
+
+          announcements_channel = "1546247479870226472"
+          message = post(announcements_channel, announcement)
+          announcement_url = (
+              "https://discord.com/channels/1546233919609774181/"
+              f"{announcements_channel}/{message['id']}"
+          )
+          post(
+              "1546233920926916630",
+              {
+                  "content": f"**Path {tag}** ({channel}) is available. Read the announcement: {announcement_url}",
+                  "allowed_mentions": {"parse": []},
+              },
+          )
+          PY
+
+  package:
+    name: Prepare AUR package update
+    needs: [prepare, release]
+    if: inputs.mode != 'nightly' && vars.AUR_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+    environment: package-automation
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Install automation tools
+        run: |
+          pacman -Syu --noconfirm --needed github-cli python
+          useradd --create-home builder
+
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.PACKAGE_PR_TOKEN }}
+
+      - name: Regenerate packages and open a pull request
+        env:
+          BRANCH: build/aur-v${{ needs.prepare.outputs.version }}
+          GH_TOKEN: ${{ secrets.PACKAGE_PR_TOKEN }}
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          args=()
+          if [[ "$MODE" == stable ]]; then
+            args+=(--stable "$VERSION")
+          fi
+
+          candidate=$(python3 -c 'import sys; from scripts.update_aur import package_version; print(package_version(sys.argv[1]))' "$VERSION")
+          current=$(grep -m1 '^pkgver=' packaging/aur/pathfm-rc-bin/PKGBUILD | cut -d= -f2)
+          if (( $(vercmp "$candidate" "$current") >= 0 )); then
+            args+=(--preview "$VERSION")
+          fi
+
+          if (( ${#args[@]} == 0 )); then
+            echo "v$VERSION is older than the packaged Preview release."
+            exit 0
+          fi
+          chown -R builder:builder packaging/aur
+          runuser -u builder -- python3 scripts/update_aur.py "${args[@]}"
+
+          if git diff --quiet -- packaging/aur; then
+            echo "AUR packages already describe v$VERSION."
+            exit 0
+          fi
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add packaging/aur
+          git commit -m "build(arch): update AUR packages for v$VERSION"
+          if remote_sha=$(git ls-remote --exit-code --heads origin "$BRANCH" | cut -f1); then
+            git push --force-with-lease="$BRANCH:$remote_sha" origin "HEAD:$BRANCH"
+          else
+            git push origin "HEAD:$BRANCH"
+          fi
+
+          if gh pr view "$BRANCH" >/dev/null 2>&1; then
+            exit 0
+          fi
+          cat > /tmp/aur-package-pr.md <<EOF
+          ## Description
+
+          Updates the reviewed AUR package sources for Path v$VERSION.
+
+          ## How to test
+
+          Install either generated package and confirm its version is v$VERSION.
+
+          ## Visual evidence
+
+          N/A — generated package metadata only.
+          EOF
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$BRANCH" \
+            --title "build(arch): update AUR packages for v$VERSION" \
+            --body-file /tmp/aur-package-pr.md

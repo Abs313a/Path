@@ -1,0 +1,57 @@
+[files]
+extend-exclude = [
+  "data/fonts/**",
+  "data/icons/**",
+  "data/licenses/**",
+  "Cargo.lock",
+  # English is checked in en.json; English dictionaries cannot check translations.
+  "data/locales/**/de.json",
+  "data/locales/**/es.json",
+  "data/locales/**/fr.json",
+  "data/locales/**/it.json",
+  "data/locales/**/ja.json",
+  "data/locales/**/ko.json",
+  "data/locales/**/pt-BR.json",
+  "data/locales/**/ru.json",
+  "data/locales/**/vi.json",
+  "data/locales/**/zh-CN.json",
+  # Reproducible upstream MathJax bundle and npm dependency lock.
+  "data/math-renderer.js",
+  "packaging/math-renderer/package-lock.json",
+]
+
+[default]
+extend-ignore-re = [
+  "`crypted\\.rar`",
+  # Deliberately misspelled input in the Settings closest-match regression.
+  '"relase chanel"',
+  # French caption exercised by the restart-to-apply regression.
+  '"Redémarrer maintenant"',
+  # German F1 row exercised by the localized shortcut reference regression.
+  '"Ausgewählte Elemente kopieren / ausschneiden"',
+  # Non-English values in the multilingual count and calendar catalogs.
+  '(?m)^\s*"(?:fr|de|es|ja|pt-BR|ko|vi|it|ru|zh-CN)": ".*"',
+  # Localized desktop-entry values.
+  '(?m)^\w+\[(?:fr|de|es|ja|pt_BR|ko|vi|it|ru|zh_CN)\]=.*$',
+  # "café" fixtures spelled as raw, replacement-character or percent-encoded bytes.
+  'caf(\\x[0-9a-fA-F]{2}|\\u\{FFFD\}|%[0-9A-Fa-f]{2})',
+]
+
+[default.extend-words]
+# RTF control words, spelled as the format defines them.
+pard = "pard"
+headerr = "headerr"
+falt = "falt"
+Distro = "Distro"
+Hyprland = "Hyprland"
+JetBrains = "JetBrains"
+Darcula = "Darcula"
+darcula = "darcula"
+Path = "Path"
+WRONLY = "WRONLY"
+gir = "gir"
+# Verbatim file extensions.
+mak = "mak"
+edn = "edn"
+ags = "ags"
+tese = "tese"
