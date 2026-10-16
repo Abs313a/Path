@@ -1,7 +1,7 @@
 # Source0 and Source1 are prepared from an immutable commit by make_srpm.py.
 %global debug_package %{nil}
 Name:           path
-Version:        1.0.0
+Version:        2.0.0
 Release:        1%{?path_commit:.git%{path_commit}}%{?dist}
 Summary:        Keyboard-first GTK4 file manager
 License:        MIT AND LicenseRef-UnRAR
