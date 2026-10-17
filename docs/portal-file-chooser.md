@@ -105,7 +105,10 @@ The generated D-Bus service contains the absolute path of the command being run.
 
 ### Manual installation
 
-The equivalent commands below use the default XDG locations and an existing installation at `~/.local/bin/pathfm`:
+The manual commands below use the default XDG locations, this source tree's
+`data/portal/` assets, and an existing installation at `~/.local/bin/pathfm`.
+Run them from the repository root. Prefer `pathfm --install-portal` when possible:
+it records the previous chooser configuration so uninstall can restore it.
 
 ```bash
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -118,10 +121,10 @@ pathfm_replacement="${pathfm_replacement//|/\\|}"
 install -d "$data_home/xdg-desktop-portal/portals" \
   "$data_home/dbus-1/services" \
   "$config_home/xdg-desktop-portal"
-install -m 644 portal/pathfm.portal \
+install -m 644 data/portal/pathfm.portal \
   "$data_home/xdg-desktop-portal/portals/pathfm.portal"
 sed "s|@PATHFM_EXECUTABLE@|$pathfm_replacement|" \
-  portal/org.freedesktop.impl.portal.desktop.pathfm.service.in \
+  data/portal/org.freedesktop.impl.portal.desktop.pathfm.service.in \
   > "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.pathfm.service"
 chmod 644 "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.pathfm.service"
 gdbus call --session \
@@ -139,7 +142,11 @@ Open `$config_home/xdg-desktop-portal/portals.conf`, preserve its existing `[pre
 org.freedesktop.impl.portal.FileChooser=pathfm;<existing-backend>;
 ```
 
-Replace `<existing-backend>` with the backend already configured for the desktop, such as `gtk` or `gnome`. Do not install the placeholder literally and do not replace unrelated portal preferences. The archive's `portal/portals.conf` is an example, not a complete desktop configuration.
+Replace `<existing-backend>` with the backend already configured for the desktop,
+such as `gtk` or `gnome`. On dwm-titus, keep `gtk` after `pathfm;` when opting in.
+Do not install the placeholder literally or replace unrelated portal preferences.
+The source tree's `data/portal/portals.conf` is an example, not a complete
+desktop configuration.
 
 Restart the frontend so it rereads portal metadata and preferences:
 

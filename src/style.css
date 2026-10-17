@@ -197,6 +197,14 @@ headerbar menubutton.header-action > button:focus-visible {
   min-height: 36px;
 }
 
+/* Scroll viewports must not paint the desktop GTK theme over Path's header. */
+.tab-strip scrolledwindow,
+.tab-strip scrolledwindow > viewport,
+.breadcrumb-scroller,
+.breadcrumb-scroller > viewport {
+  background: transparent;
+}
+
 headerbar.browser-header,
 .mode-pane-header {
   border-bottom: none;
@@ -1997,6 +2005,7 @@ menubutton.form-control:disabled > button {
 }
 
 switch {
+  border-radius: 20px;
   background: @pathfm_muted;
   border: 1px solid alpha(@pathfm_border, 0.72);
   box-shadow: none;
@@ -2012,6 +2021,7 @@ switch:checked {
 
 switch slider,
 switch:checked slider {
+  border-radius: 50%;
   background: @pathfm_text;
   border: none;
   box-shadow: 0 1px 3px alpha(#000000, 0.4);
@@ -5953,6 +5963,12 @@ two-column presentation. */
   padding: 20px 15px;
   border-right: 1px solid alpha(@pathfm_border, 0.55);
   border-radius: 13px 0 0 13px;
+}
+
+/* Keep the navigation viewport from painting the desktop theme over Path. */
+.settings-dialog > scrolledwindow,
+.settings-dialog > scrolledwindow > viewport {
+  background: transparent;
 }
 
 .settings-navigation > .menu-heading {

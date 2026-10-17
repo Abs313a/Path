@@ -133,6 +133,17 @@ To set Path as your user account's default file manager for folders:
 xdg-mime default pathfm.desktop inode/directory
 ```
 
+On a fresh dwm-titus account, its default-app seeding chooses `pathfm.desktop`
+when Path is available and falls back to Thunar otherwise. Existing user MIME
+preferences are preserved. The folder default is separate from the XDG portal
+file chooser: dwm-titus keeps GTK as its chooser unless you explicitly enable
+Path through **Settings → General → System file chooser → Configure…**. See the
+[file chooser guide](docs/portal-file-chooser.md) for that optional integration.
+
+Path identifies its main window as `io.github.christitustech.Path` and chooser
+windows as `io.github.christitustech.Path.FileChooser`. Older dwm-titus rules
+for Path v1 dialog titles do not apply to Path-v2's in-window dialogs.
+
 ---
 
 ## Development & Testing
